@@ -123,7 +123,7 @@ func open_title(main: Node) -> void:
 	s.can_cancel = false
 	s.title_mode = true
 	s.dim = 0.25
-	s.footer = "Capítulos 1 e 2: Floresta e Minas da Brasa  •  ↑↓ navegar, E confirmar"
+	s.footer = "Floresta, Minas, Pântano e Fortaleza  •  ↑↓ navegar, E confirmar"
 	var items := [
 		_it("Continuar", func(): _slot_menu(main, false, true), "Retoma o último save disponível.", SaveSys.has_any_save()),
 		_it("Novo jogo", func(): _new_game_slots(main), "Começa uma nova aventura em um dos 3 slots."),
@@ -493,8 +493,8 @@ func _fill_inventory(s: MenuScreen) -> void:
 	var mats: Array = []
 	for id3 in Data.items:
 		var it3: Dictionary = Data.items[id3]
-		if it3["tipo"] in ["material", "tecnica", "historia"] and Game.item_count(id3) > 0:
-			var r3 := _it("%s%s" % [it3["nome"], (" x%d" % Game.item_count(id3)) if it3["tipo"] == "material" else ""], Callable(), it3["desc"])
+		if it3["tipo"] in ["material", "tecnica", "historia", "melhoria"] and Game.item_count(id3) > 0:
+			var r3 := _it("%s%s" % [it3["nome"], (" x%d" % Game.item_count(id3)) if it3["tipo"] in ["material", "melhoria"] else ""], Callable(), it3["desc"])
 			r3["icon"] = Game.item_icon(id3)
 			if it3.has("raridade"):
 				r3["col"] = Game.rarity_color(id3)
@@ -509,7 +509,19 @@ func _fill_inventory(s: MenuScreen) -> void:
 			("%s\n\n%s\n\nComo usar: %s" % [t["nome"], t["desc"], t["como"]]) if ok else "Técnica liberada no nível %d." % int(t["nivel"])))
 	items.append(_hdr("Ecos"))
 	for e in Game.ecos:
-		items.append(_it(Data.skills[e]["nome"], Callable(), Data.skills[e]["descricao"] + "\nTravessia contextual (E) não gasta energia."))
+		var ee: String = e
+		var slot_i: int = Game.eco_slots.find(ee)
+		items.append(_it("%s  [%s]" % [Data.skills[ee]["nome"], ("atalho %d" % (slot_i + 1)) if slot_i >= 0 else "sem atalho"], func():
+			# confirma: alterna o Eco entre os atalhos 1 e 2 (troca com o que estava lá)
+			var cur: int = Game.eco_slots.find(ee)
+			var to: int = 1 if cur == 0 else 0
+			var other: String = Game.eco_slots[to]
+			Game.eco_slots[to] = ee
+			if cur >= 0:
+				Game.eco_slots[cur] = other
+			Game.eco_changed.emit()
+			toast("%s no atalho %d." % [Data.skills[ee]["nome"], to + 1])
+			_fill_inventory(s), Data.skills[ee]["descricao"] + "\nTravessia contextual (E) não gasta energia.\nConfirme para trocar o atalho (1/2) deste Eco."))
 	if Game.ecos.is_empty():
 		items.append(_it("(nenhum ainda)", Callable(), "Guardiões concedem Ecos permanentes."))
 	items.append(_it("Voltar", func(): s.close()))
