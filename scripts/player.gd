@@ -53,6 +53,9 @@ var atk_hold := 0.0
 var atk_pressed_prev := false
 var eco_cd := [0.0, 0.0]
 var energy_gain_window := 0.0
+var powers: Node = null       # técnicas especiais (hero_powers.gd)
+var carry_fire_t := 0.0       # chama de braseiro nas mãos (Região 2)
+var _carry_fx: AnimatedSprite2D
 
 # captura
 var aiming := false
@@ -107,6 +110,13 @@ func _ready() -> void:
 	_sword.visible = false
 	add_child(_sword)
 	sprite.play("idle_down")
+	_carry_fx = AnimatedSprite2D.new()
+	_carry_fx.sprite_frames = Art.fx_frames("fx_fire", 16, 16, 4, 10.0, true)
+	_carry_fx.position = Vector2(6, -26)
+	_carry_fx.scale = Vector2(0.75, 0.75)
+	_carry_fx.visible = false
+	_carry_fx.play("a")
+	add_child(_carry_fx)
 	add_to_group("hero")
 	reset_resources()
 
@@ -118,6 +128,7 @@ func reset_resources() -> void:
 	aiming = false
 	cap_state = ""
 	cap_target = null
+	carry_fire_t = 0.0
 	atk_hit.clear()
 	sprite.modulate = Color.WHITE
 	sprite.rotation = 0.0
@@ -166,6 +177,12 @@ func _tick_timers(delta: float) -> void:
 	for i in 2:
 		eco_cd[i] = max(0.0, eco_cd[i] - delta)
 	_flash = max(0.0, _flash - delta)
+	if carry_fire_t > 0.0:
+		carry_fire_t = max(0.0, carry_fire_t - delta)
+		if carry_fire_t <= 0.0:
+			world.say("A chama se apagou nas suas mãos.")
+	if _carry_fx:
+		_carry_fx.visible = carry_fire_t > 0.0
 
 func _regen(delta: float) -> void:
 	vigor_idle += delta
@@ -270,7 +287,7 @@ func _state_attack(delta: float) -> void:
 			state = S.FREE
 
 func _attack_hits() -> void:
-	var dmg: float = Game.hero_atk() * float(atk_def["mult"])
+	var dmg: float = Game.hero_atk() * float(atk_def["mult"]) * (powers.damage_mult() if powers != null else 1.0)
 	for e in world.enemies():
 		if atk_hit.has(e.get_instance_id()):
 			continue
@@ -283,6 +300,8 @@ func _attack_hits() -> void:
 		atk_hit[e.get_instance_id()] = true
 		var got: float = e.take_damage(dmg, global_position, {"src": "heroi", "knock": float(atk_def["knock"]), "ataque": "espada", "dir": aim_dir})
 		if got > 0.0:
+			if powers != null:
+				powers.consume_counter()
 			if energy_gain_window < 6.0:
 				energy = min(ENERGY_MAX, energy + 2.0)
 				energy_gain_window += 2.0
@@ -302,6 +321,9 @@ func _start_attack(def: Dictionary, charged: bool) -> void:
 	atk_queued = false
 	_slash_done = false
 	atk_def["idx"] = 3 if charged else combo_idx
+	var wp := Game.weapon_profile()
+	atk_def["r"] = float(atk_def["r"]) + float(wp["alcance"])
+	atk_def["arc"] = float(atk_def["arc"]) * float(wp["arco"])
 	atk_hit.clear()
 	if world.mouse_aiming():
 		var d := (get_global_mouse_position() - global_position)
@@ -376,13 +398,16 @@ func take_hit(dmg: float, from: Vector2, opts: Dictionary = {}) -> bool:
 		return false
 	if inv_timer > 0.0 or is_dodge_invulnerable():
 		return false
+	if powers != null and powers.try_parry(dmg, from, opts):
+		return false
 	dmg *= Game.enemy_damage_mult() * (1.0 - Game.hero_reduction())
 	var to_src := (from - global_position).normalized()
 	if state == S.GUARD and not opts.get("indefensavel", false) and aim_dir.dot(to_src) > 0.2:
 		var cost := dmg * 0.9
 		if vigor >= cost:
 			_use_vigor(cost)
-			var taken := dmg * (1.0 - GUARD_REDUCTION)
+			# golpe pesado "parcialmente indefensável": a defesa segura só 30%
+			var taken := dmg * (1.0 - (0.3 if opts.get("guarda_parcial", false) else GUARD_REDUCTION))
 			_apply_damage(taken)
 			inv_timer = 0.2
 			velocity = -to_src * 60.0
@@ -410,6 +435,17 @@ func take_hit(dmg: float, from: Vector2, opts: Dictionary = {}) -> bool:
 	world.hitstop(0.06)
 	world.shake(3.0, 0.15)
 	return true
+
+## Dano do ambiente (piso quente, poça de escória, piso que desaba): sem atordoar nem empurrar.
+func env_damage(d: float, txt := "") -> void:
+	if state == S.DEAD or Game.god_mode:
+		return
+	d *= Game.enemy_damage_mult() * (1.0 - Game.hero_reduction() * 0.5)
+	_flash = 0.12
+	Audio.play("hurt", -10.0)
+	if txt != "":
+		world.spawn_text(global_position + Vector2(0, -36), txt, Color(1.0, 0.6, 0.3))
+	_apply_damage(d)
 
 func _apply_damage(d: float) -> void:
 	Game.hero["hp"] = max(0.0, float(Game.hero["hp"]) - d)
@@ -460,6 +496,8 @@ func use_eco(slot: int) -> void:
 	eco_cd[slot] = float(sk.get("recarga", 8.0))
 	if id == "raiz_viva":
 		world.eco_raiz_viva(global_position + aim_dir * 14.0)
+	elif id == "ruptura_ignea":
+		world.eco_ruptura(global_position + aim_dir * 22.0, aim_dir)
 
 # =============================================================== CAPTURA
 func _capture_pressed() -> void:
@@ -604,7 +642,11 @@ func _resolve_capture() -> void:
 			return
 		t.captured_by_hero()
 		var nm: String = Data.sp(t.species_id).get("nome", "")
-		world.say("%s capturado! (%s)" % [nm, "equipe" if dest == "equipe" else "santuário"])
+		if dest == "equipe":
+			world.say("%s capturado! Entrou na equipe (%d/3)." % [nm, Game.team.size()])
+		else:
+			world.say("%s capturado! Equipe cheia: guardado no Santuário (%d/%d)." % [nm, Game.sanctuary.size(), Game.SANCTUARY_CAP])
+			world.say("Troque criaturas em qualquer cristal de santuário.")
 		Audio.play("capture_ok")
 		world.refresh_companion(true)
 		_end_capture("", true)
@@ -693,6 +735,8 @@ func _update_sword(delta: float) -> void:
 	_sword.visible = true
 	_sword.rotation = base + ang
 	_sword.scale = Vector2.ONE * float(sw[2])
+	if bool(Game.weapon_profile()["lanca"]):
+		_sword.scale.x *= 1.45        # lança: haste mais longa (mesmo sprite, provisório)
 	_sword.modulate.a = alpha
 	# mão: um pouco à frente do corpo; de costas a espada passa por trás
 	_sword.position = Vector2(0, -12) + aim_dir * 3.0

@@ -123,7 +123,7 @@ func open_title(main: Node) -> void:
 	s.can_cancel = false
 	s.title_mode = true
 	s.dim = 0.25
-	s.footer = "Capítulo 1: Floresta dos Esquecidos  •  ↑↓ navegar, E confirmar"
+	s.footer = "Capítulos 1 e 2: Floresta e Minas da Brasa  •  ↑↓ navegar, E confirmar"
 	var items := [
 		_it("Continuar", func(): _slot_menu(main, false, true), "Retoma o último save disponível.", SaveSys.has_any_save()),
 		_it("Novo jogo", func(): _new_game_slots(main), "Começa uma nova aventura em um dos 3 slots."),
@@ -364,19 +364,50 @@ func _fill_inventory(s: MenuScreen) -> void:
 			toast("Talentos redistribuídos."); _fill_inventory(s)
 		else:
 			toast("Fragmentos insuficientes."), "Devolve todos os pontos gastos."))
-	items.append(_hdr("Equipamento"))
+	items.append(_hdr("Equipamento (cor = raridade)"))
+	var eqs: Array = []
 	for id in Data.items:
+		if Game.is_equipment(id) and Game.item_count(id) > 0:
+			eqs.append(id)
+	var slot_order := {"arma": 0, "protecao": 1, "amuleto": 2}
+	eqs.sort_custom(func(x, y):
+		var sx: int = slot_order[Data.items[x]["tipo"]]; var sy: int = slot_order[Data.items[y]["tipo"]]
+		return sx < sy or (sx == sy and Game.rarity_of(x) > Game.rarity_of(y)))
+	for id in eqs:
 		var it: Dictionary = Data.items[id]
 		var idd: String = id
-		if it["tipo"] in ["arma", "protecao", "amuleto"] and Game.item_count(idd) > 0:
-			var eq: bool = Game.equipment.get(it["tipo"], "") == idd
-			items.append(_it("%s%s" % ["● " if eq else "  ", it["nome"]], func(): Game.equip(idd); _fill_inventory(s), it["desc"]))
+		var eq: bool = Game.equipment.get(it["tipo"], "") == idd
+		var lv := Game.upgrade_level(idd)
+		var row := _it("%s%s%s" % ["● " if eq else "  ", it["nome"], (" +%d" % lv) if lv > 0 else ""], func(): _equip_menu(idd, s), func(): return Game.item_details(idd))
+		row["col"] = Game.rarity_color(idd)
+		row["icol"] = Game.rarity_color(idd).lerp(Color.WHITE, 0.55)
+		row["icon"] = Game.item_icon(idd)
+		items.append(row)
 	items.append(_hdr("Itens"))
 	for id2 in Data.items:
 		var it2: Dictionary = Data.items[id2]
 		var id2c: String = id2
 		if it2["tipo"] in ["selo", "consumivel", "consumivel_criatura"] and Game.item_count(id2c) > 0:
-			items.append(_it("%s x%d" % [it2["nome"], Game.item_count(id2c)], func(): _use_item(id2c, s), it2["desc"] + "\nAção: usar", it2["tipo"] != "selo"))
+			var r2 := _it("%s x%d" % [it2["nome"], Game.item_count(id2c)], func(): _use_item(id2c, s), it2["desc"] + "\nAção: usar", it2["tipo"] != "selo")
+			r2["icon"] = Game.item_icon(id2c)
+			items.append(r2)
+	var mats: Array = []
+	for id3 in Data.items:
+		var it3: Dictionary = Data.items[id3]
+		if it3["tipo"] in ["material", "tecnica", "historia"] and Game.item_count(id3) > 0:
+			var r3 := _it("%s%s" % [it3["nome"], (" x%d" % Game.item_count(id3)) if it3["tipo"] == "material" else ""], Callable(), it3["desc"])
+			r3["icon"] = Game.item_icon(id3)
+			if it3.has("raridade"):
+				r3["col"] = Game.rarity_color(id3)
+			mats.append(r3)
+	if not mats.is_empty():
+		items.append(_hdr("Materiais, técnicas e diários"))
+		items.append_array(mats)
+	items.append(_hdr("Técnicas"))
+	for t in HeroPowers.TECHS:
+		var ok: bool = Game.hero_level() >= int(t["nivel"])
+		items.append(_it(("%s" % t["nome"]) if ok else ("Nv.%d — ???" % int(t["nivel"])), Callable(),
+			("%s\n\n%s\n\nComo usar: %s" % [t["nome"], t["desc"], t["como"]]) if ok else "Técnica liberada no nível %d." % int(t["nivel"])))
 	items.append(_hdr("Ecos"))
 	for e in Game.ecos:
 		items.append(_it(Data.skills[e]["nome"], Callable(), Data.skills[e]["descricao"] + "\nTravessia contextual (E) não gasta energia."))
@@ -386,6 +417,77 @@ func _fill_inventory(s: MenuScreen) -> void:
 	s.setup("Inventário e herói", items, "")
 	s.list_w = 220.0
 	s.sel = 1
+
+func _equip_menu(id: String, parent: MenuScreen) -> void:
+	var it: Dictionary = Data.items[id]
+	var s := _push(it["nome"], [], "")
+	var eq: bool = Game.equipment.get(it["tipo"], "") == id
+	var why := Game.dismantle_check(id)
+	var items: Array = []
+	items.append(_it("Equipar" if not eq else "Equipado", func():
+		Game.equip(id); s.close(); _fill_inventory(parent), Game.item_details(id), not eq))
+	items.append(_it("Desmontar…", func():
+		_confirm("Desmontar %s?" % it["nome"], Game.item_details(id) + "\n\nA peça some para sempre.", func():
+			if Game.dismantle(id):
+				Audio.play("thud"); s.close(); _fill_inventory(parent)), Game.item_details(id) if why == "" else why, why == ""))
+	items.append(_it("Voltar", func(): s.close()))
+	for row in items:
+		row["icon"] = Game.item_icon(id)
+		row["icol"] = Game.rarity_color(id).lerp(Color.WHITE, 0.55)
+	s.setup(it["nome"], items, Game.item_details(id))
+
+func open_craft() -> void:
+	var s := _push("Montar equipamento", [], "")
+	_fill_craft(s)
+
+func _fill_craft(s: MenuScreen) -> void:
+	var items: Array = []
+	var ids: Array = Data.recipes.keys()
+	ids.sort_custom(func(x, y): return Game.rarity_of(x) < Game.rarity_of(y))
+	for rid in ids:
+		var r: String = rid
+		var why := Game.craft_check(r)
+		var info := func(): return Game.item_details(r).split("\n\nDesmontar")[0] + "\n\nCusto: " + Game.craft_cost_text(r) + ("" if Game.craft_check(r) == "" else "\n\n" + Game.craft_check(r))
+		var row := _it(Data.items[r]["nome"] if Game.has_flag(str(Data.recipes[r].get("requer", ""))) or not Data.recipes[r].has("requer") else "??? (" + Game.rarity_name(r) + ")", func():
+			var w2 := Game.craft_check(r)
+			if w2 != "":
+				toast(w2); Audio.play("puzzle_no"); return
+			_confirm("Montar %s?" % Data.items[r]["nome"], "Custo: " + Game.craft_cost_text(r), func():
+				if Game.craft(r):
+					Audio.play("levelup"); world.shake(1.0, 0.1)
+				_fill_craft(s)), info, why == "" or why == "Faltam materiais." or why == "Fragmentos insuficientes.")
+		row["col"] = Game.rarity_color(r)
+		row["icol"] = Game.rarity_color(r).lerp(Color.WHITE, 0.55)
+		row["icon"] = Game.item_icon(r)
+		items.append(row)
+	items.append(_it("Voltar", func(): s.close()))
+	s.setup("Montar — fragmentos: %d" % Game.fragments, items, "")
+	s.list_w = 230.0
+
+func open_dismantle() -> void:
+	var s := _push("Desmontar equipamento", [], "")
+	_fill_dismantle(s)
+
+func _fill_dismantle(s: MenuScreen) -> void:
+	var items: Array = []
+	for id in Data.items:
+		if Game.is_equipment(id) and Game.item_count(id) > 0:
+			var idd: String = id
+			var why := Game.dismantle_check(idd)
+			var row := _it(Data.items[idd]["nome"] + ((" +%d" % Game.upgrade_level(idd)) if Game.upgrade_level(idd) > 0 else ""), func():
+				_confirm("Desmontar %s?" % Data.items[idd]["nome"], Game.item_details(idd) + "\n\nA peça some para sempre.", func():
+					if Game.dismantle(idd):
+						Audio.play("thud")
+					_fill_dismantle(s)), func(): return Game.item_details(idd) + ("" if Game.dismantle_check(idd) == "" else "\n\n" + Game.dismantle_check(idd)), why == "")
+			row["col"] = Game.rarity_color(idd)
+			row["icol"] = Game.rarity_color(idd).lerp(Color.WHITE, 0.55)
+			row["icon"] = Game.item_icon(idd)
+			items.append(row)
+	if items.is_empty():
+		items.append(_it("(nada para desmontar)", Callable(), "Peças equipadas não podem ser desmontadas."))
+	items.append(_it("Voltar", func(): s.close()))
+	s.setup("Desmontar", items, "")
+	s.list_w = 230.0
 
 func _use_item(id: String, s: MenuScreen) -> void:
 	if world.in_combat():
@@ -470,6 +572,17 @@ func open_map() -> void:
 				"desfiladeiro": note = "" if Game.has_flag("ponte_minas") else "  ⚠ ponte (Raiz Viva)"
 				"bosque_lanternas": note = "" if Game.has_flag("bosque_flores") else "  ⚠ portão de flores"
 				"clareira_raizes": note = "" if Game.has_flag("clareira_placas") else "  ⚠ raízes/placas"
+				"forja_cobre":
+					var n2: Array = []
+					if not Game.has_flag("forja_rocha"): n2.append("⚠ rocha fissurada — Ruptura Ígnea")
+					if not Game.has_flag("ferreiro_morto"): n2.append("⚠ elevador parado")
+					n2.append("⚠ inscrição oculta — Olhar Velado")
+					note = "  " + ", ".join(n2)
+				"pedreira_oca":
+					note = "  ⚠ veio selado — Ruptura Ígnea" if Game.has_flag("veio_revelado") and not Game.has_flag("veio_rocha") else ("" if Game.has_flag("veio_revelado") else "  ⚠ corrente de ar")
+				"trilhos_fundidos": note = "" if Game.has_flag("trilhos_carrinho") else "  ⚠ portão do carrinho"
+				"fundicao_a": note = "  ⚠ inscrição oculta — Olhar Velado"
+				"rito_forja": note = "" if Game.has_flag("rito_rocha") else ("  ⚠ rocha fissurada — Ruptura Ígnea (rito avançado)" if Game.has_flag("rito_ok") else "")
 			items.append(_it("%s %s%s" % ["+" if visited else "·", m["name"] if visited else "???", note], Callable(), "Bloqueios marcados com ⚠ mostram o que ainda impede a passagem."))
 	items.append(_it("Voltar", func(): s.close()))
 	s.setup("Mapa do continente de Auralis", items, "+ visitada   · ainda não visitada   ⚠ bloqueio.")
@@ -497,6 +610,7 @@ func open_shrine_menu() -> void:
 		_it("Descansar (curar tudo)", func(): world.rest_at_shrine(); toast("Descansou. Criaturas e herói recuperados."), "Restaura herói e criaturas (inclusive exaustas). Inimigos comuns reaparecem."),
 		_it("Salvar jogo", func(): open_save_slots(), "Grava o progresso."),
 		_it("Equipe e criaturas", func(): open_team(), "Troque criaturas com o armazenamento do santuário e evolua as que estiverem prontas."),
+		_it("Armazenamento (%d/%d)" % [Game.sanctuary.size(), Game.SANCTUARY_CAP], func(): open_storage(), "Criaturas guardadas: leve para a equipe (máximo 3), dê apelidos, ordene ou liberte."),
 		_it("Reespecializar talentos (50)", func(): if Game.respec(50): toast("Talentos redistribuídos.") else: toast("Fragmentos insuficientes."), "Redistribui pontos de talento."),
 		_it("Sair", func(): s.close()),
 	]
@@ -504,11 +618,13 @@ func open_shrine_menu() -> void:
 	s.closed.connect(func(): if world.player.state == Player.S.INTERACT and not has_screen(): world.player.set_busy(false))
 
 # =============================================================== LOJA
-func open_shop() -> void:
+func open_shop(shop_id := "ysa") -> void:
 	world.player.set_busy(true)
-	var s := _push("Loja da Ysa", [], "")
+	var shop: Dictionary = Data.forge.get("lojas", {}).get(shop_id, {"nome": "Loja", "itens": []})
+	var title: String = shop["nome"]
+	var s := _push(title, [], "")
 	var items: Array = []
-	for id in ["selo_basico", "selo_refinado", "pocao", "tonico_criatura"]:
+	for id in shop["itens"]:
 		var idd: String = id
 		var it: Dictionary = Data.items[idd]
 		items.append(_it("%s  — %d" % [it["nome"], int(it["preco"])], func():
@@ -518,7 +634,7 @@ func open_shop() -> void:
 			else:
 				Audio.play("pickup"); toast("Comprou %s." % it["nome"]); s.footer = "Fragmentos: %d" % Game.fragments, it["desc"] + "\nPreço: %d fragmentos." % int(it["preco"])))
 	items.append(_it("Sair", func(): s.close()))
-	s.setup("Loja da Ysa", items, "Fragmentos: %d" % Game.fragments)
+	s.setup(title, items, "Fragmentos: %d" % Game.fragments)
 	s.footer = "Fragmentos: %d" % Game.fragments
 	s.closed.connect(func(): world.player.set_busy(false))
 
@@ -572,3 +688,54 @@ func _fill_options(s: MenuScreen) -> void:
 	s.setup("Opções", items, "")
 	s.sel = keep
 	s.list_w = 250.0
+
+# =============================================================== FORJA (melhoria de equipamento)
+## Lista o equipamento usado; a informação mostra antes → depois e o custo. Confirmar pede uma tela de comparação.
+func open_forge() -> void:
+	world.player.set_busy(true)
+	var s := _push("Forja", [], "")
+	_fill_forge(s)
+	s.closed.connect(func(): if world.player.state == Player.S.INTERACT and not has_screen(): world.player.set_busy(false))
+
+func _forge_info(id: String) -> String:
+	if id == "":
+		return "Nada equipado neste espaço."
+	var pv := Game.forge_preview(id)
+	var why := Game.forge_check(id)
+	var t := "%s  +%d\n\nAntes:  %s\nDepois: %s\n\nCusto: %s" % [Data.items[id]["nome"], pv["nivel"], pv["antes"], pv["depois"], pv["custo"]]
+	if why != "":
+		t += "\n\n" + why
+	return t
+
+func _fill_forge(s: MenuScreen) -> void:
+	var items: Array = []
+	items.append(_hdr("Equipamento em uso"))
+	for slot in ["arma", "protecao", "amuleto"]:
+		var id: String = Game.equipment.get(slot, "")
+		var label: String = {"arma": "Arma", "protecao": "Proteção", "amuleto": "Amuleto"}[slot]
+		if id == "":
+			items.append(_it("%s: —" % label, Callable(), "Nada equipado neste espaço.", false))
+			continue
+		var idd := id
+		items.append(_it("%s: %s +%d" % [label, Data.items[id]["nome"], Game.upgrade_level(id)], func():
+			var why := Game.forge_check(idd)
+			if why != "":
+				toast(why)
+				Audio.play("puzzle_no")
+				return
+			var pv := Game.forge_preview(idd)
+			_confirm("Melhorar %s para +%d?" % [Data.items[idd]["nome"], int(pv["nivel"]) + 1],
+				"ANTES:  %s\nDEPOIS: %s\n\nCusto: %s" % [pv["antes"], pv["depois"], pv["custo"]], func():
+					if Game.forge_upgrade(idd):
+						Audio.play("levelup")
+						world.shake(1.0, 0.1)
+					_fill_forge(s)), func(): return _forge_info(idd)))
+	items.append(_hdr("Oficina"))
+	items.append(_it("Montar equipamento", func(): open_craft(), "Monte peças novas com essências e materiais. A cor mostra a raridade: verde, azul, roxo, laranja e vermelho."))
+	items.append(_it("Desmontar equipamento", func(): open_dismantle(), "Transforme peças que você não usa em essências da mesma cor e fragmentos."))
+	items.append(_hdr("Materiais"))
+	for mat in ["minerio_cobre", "brasa_viva", "lingote", "essencia_verde", "essencia_azul", "essencia_roxa", "essencia_laranja", "essencia_rubra", "casca_oca", "osso_ancestral"]:
+		items.append(_it("%s x%d" % [Data.items[mat]["nome"], Game.item_count(mat)], Callable(), Data.items[mat]["desc"]))
+	items.append(_it("Sair", func(): s.close()))
+	s.setup("Forja — fragmentos: %d" % Game.fragments, items, "Escolha o que melhorar.")
+	s.list_w = 230.0

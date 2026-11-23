@@ -5,10 +5,12 @@ var species := {}
 var skills := {}
 var enemies := {}
 var items := {}
+var recipes := {}
 var bosses := {}
 var regions := {}
 var quests := {}
 var dialogs := {}
+var forge := {}
 var maps := {}
 var errors: Array = []
 
@@ -35,7 +37,9 @@ func load_all() -> void:
 	bosses = _read("res://data/bosses.json")
 	regions = _read("res://data/regions.json")
 	quests = _read("res://data/quests.json")
+	recipes = _read("res://data/recipes.json")
 	dialogs = _read("res://data/dialogs.json")
+	forge = _read("res://data/forge.json")
 	maps.clear()
 	for rid in regions:
 		for mid in regions[rid].get("mapas", []):
@@ -75,6 +79,24 @@ func validate() -> Array:
 						errors.append("Mapa %s: item inexistente '%s' no baú %s" % [mid, it, e.get("id", "")])
 			elif t in ["npc", "sign"] and not dialogs.has(e.get("dialog", "")):
 				errors.append("Mapa %s: diálogo inexistente '%s'" % [mid, e.get("dialog", "")])
+	for sh in forge.get("lojas", {}):
+		for it in forge["lojas"][sh]["itens"]:
+			if not items.has(it):
+				errors.append("Loja %s: item inexistente '%s'" % [sh, it])
+	for mid in maps:
+		for e in maps[mid].get("entities", []):
+			if e.get("type", "") in ["miniboss", "boss"] and not bosses.has(e.get("boss", "lenhador" if e["type"] == "miniboss" else "cervo")):
+				errors.append("Mapa %s: chefe inexistente" % mid)
+			if e.get("type", "") == "altar":
+				for it in e.get("loot", {}):
+					if not items.has(it):
+						errors.append("Mapa %s: item inexistente '%s' no altar" % [mid, it])
+	for rid in recipes:
+		if not items.has(rid):
+			errors.append("Receita %s: item resultante inexistente" % rid)
+		for it in recipes[rid].get("custo", {}):
+			if not items.has(it):
+				errors.append("Receita %s: material inexistente '%s'" % [rid, it])
 	for did in dialogs:
 		for v in dialogs[did]:
 			for it in v.get("give", {}):
