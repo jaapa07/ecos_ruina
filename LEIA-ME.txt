@@ -1,0 +1,2 @@
+Ecos da Ruína — versão jogável no navegador (GitHub Pages).
+Código-fonte no branch principal deste repositório.

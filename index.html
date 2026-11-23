@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#120e1c">
+<meta charset="utf-8">
+<title>Ecos da Ruína</title>
+<style>
+/* Layout: janela de jogo 16:9 no topo, faixa de controles abaixo. Visual único, escuro (tela de jogo). */
+:root {
+  --bg: #120e1c;
+  --panel: #1d1830;
+  --edge: #c9a04a;
+  --fg: #ece8f6;
+  --muted: #a49cc0;
+  --accent: #9be8ff;
+  --leaf: #7ac860;
+  --display: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --body: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); margin: 0; }
+.wrap { max-width: 1100px; margin: 0 auto; padding-block: 16px 24px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 14px; }
+h1 { font-family: var(--display); font-size: clamp(14px, 2.4vw, 20px); color: var(--edge); margin: 0; letter-spacing: 0.04em; text-wrap: balance; }
+.sub { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
+.screen { position: relative; width: 100%; aspect-ratio: 16 / 9; max-width: 100%; background: #000; border: 3px solid var(--edge); border-radius: 4px; overflow: hidden; box-shadow: 0 0 0 3px #000, 0 10px 30px rgba(0,0,0,0.5); }
+#canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; outline: none; }
+.overlay { position: absolute; inset: 0; display: grid; place-content: center; gap: 14px; text-align: center; background: radial-gradient(circle at 50% 40%, #2a2246, #0b0912 75%); padding: 16px; }
+.overlay[hidden] { display: none !important; }
+.overlay .t { font-family: var(--display); font-size: clamp(12px, 2vw, 18px); color: var(--edge); }
+.bar { width: min(360px, 70vw); height: 10px; background: #0b0912; border: 2px solid var(--edge); margin: 0 auto; }
+.bar > i { display: block; height: 100%; width: 0%; background: var(--leaf); transition: width .2s; }
+.msg { font-size: 13px; color: var(--muted); min-height: 1.2em; }
+button { font-family: var(--display); font-size: 12px; color: #120e1c; background: var(--edge); border: 0; padding: 12px 18px; cursor: pointer; box-shadow: 0 4px 0 #7a5a20; }
+button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+button:active { transform: translateY(2px); box-shadow: 0 2px 0 #7a5a20; }
+.keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 18px; background: var(--panel); border: 2px solid #3a3058; padding: 14px; font-size: 13px; }
+.keys div { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+kbd { font-family: var(--display); font-size: 10px; color: var(--accent); white-space: nowrap; }
+.note { color: var(--muted); font-size: 12px; margin: 0; }
+@media (prefers-reduced-motion: reduce) { .bar > i { transition: none; } }
+/* toque: canvas não rola nem dá zoom */
+#canvas { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.touchtips { display: none; }
+.rotate { display: none; }
+@media (pointer: coarse) {
+  .keys { display: none; }
+  .touchtips { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px 14px; background: var(--panel); border: 2px solid #3a3058; padding: 12px; font-size: 13px; }
+  .note.desk { display: none; }
+}
+/* celular deitado: o jogo ocupa a tela toda */
+@media (pointer: coarse) and (orientation: landscape) {
+  html, body { overflow: hidden; overscroll-behavior: none; }
+  .wrap { padding-block: 0; gap: 0; max-width: none; height: 100%; align-content: center; justify-items: center; }
+  header, .touchtips, .note { display: none; }
+  .screen { width: auto; height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); max-height: 100dvh; max-width: 100%; border-width: 0; border-radius: 0; box-shadow: none; }
+}
+/* celular em pé: pede para girar */
+@media (pointer: coarse) and (orientation: portrait) {
+  .rotate { display: block; font-family: var(--display); font-size: 11px; color: var(--edge); text-align: center; line-height: 1.6; padding: 10px; border: 2px dashed var(--edge); }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1>ECOS DA RUÍNA</h1>
+    <p class="sub">As cinco regiões de Auralis — do Bosque à Catedral do Vazio. Versão para navegador e iPhone.</p>
+  </header>
+
+  <div class="screen">
+    <canvas id="canvas" width="960" height="540" tabindex="0">Seu navegador precisa de WebGL 2 para rodar o jogo.</canvas>
+    <div class="overlay" id="start">
+      <div class="t">Pronto para jogar</div>
+      <button id="play" type="button">Jogar</button>
+      <div class="msg">O jogo tem cerca de 46 MB e carrega uma vez.</div>
+    </div>
+    <div class="overlay" id="loading" hidden>
+      <div class="t">Carregando…</div>
+      <div class="bar"><i id="fill"></i></div>
+      <div class="msg" id="status">Baixando o motor</div>
+    </div>
+  </div>
+
+  <p class="rotate">Gire o celular e jogue deitado.</p>
+  <section class="touchtips" aria-label="Controles de toque">
+    <div>Polegar esquerdo: andar</div>
+    <div>Espada: atacar (segure: carregado)</div>
+    <div>Escudo: defender</div>
+    <div>Setas: esquivar</div>
+    <div>E: falar / interagir</div>
+    <div>Selo: mirar, toque de novo para lançar</div>
+    <div>Estrela: habilidade da criatura</div>
+    <div>No alto: trocar, tônico, menu</div>
+    <div>Técnicas (por nível): veja no menu</div>
+  </section>
+  <section class="keys" aria-label="Controles">
+    <div><kbd>WASD</kbd><span>mover</span></div>
+    <div><kbd>J</kbd><span>atacar (segure: carregado)</span></div>
+    <div><kbd>K</kbd><span>defender</span></div>
+    <div><kbd>ESPAÇO</kbd><span>esquivar</span></div>
+    <div><kbd>E</kbd><span>falar / interagir</span></div>
+    <div><kbd>F F</kbd><span>mirar e lançar o selo</span></div>
+    <div><kbd>Q</kbd><span>habilidade da criatura</span></div>
+    <div><kbd>TAB</kbd><span>trocar criatura</span></div>
+    <div><kbd>C</kbd><span>comportamento</span></div>
+    <div><kbd>R</kbd><span>tônico</span></div>
+    <div><kbd>1</kbd><span>Eco (após o chefão)</span></div>
+    <div><kbd>I / ESC</kbd><span>menu / pausa</span></div>
+    <div><kbd>Nv 2</kbd><span>esquiva + ataque: investida</span></div>
+    <div><kbd>Nv 4</kbd><span>segure J: onda de Eco</span></div>
+    <div><kbd>Nv 6</kbd><span>K no instante: defesa perfeita</span></div>
+    <div><kbd>Nv 8</kbd><span>K + Q: Fúria do Vínculo</span></div>
+  </section>
+  <p class="note desk">Clique na tela do jogo para dar foco ao teclado. O progresso fica salvo neste navegador.</p>
+  <p class="note">No iPhone, use o Safari ou o app do Claude com o celular deitado. O progresso fica salvo no próprio aparelho.</p>
+</div>
+
+<script>
+// O motor (WebAssembly) é publicado em 3 partes; aqui elas são baixadas e remontadas antes de iniciar.
+(function () {
+  const VERSAO = "202611232317";   // muda a cada publicação: o celular baixa a versão nova em vez de usar o cache
+  const PARTS = ["w/motor0.wasm", "w/motor1.wasm", "w/motor2.wasm"].map(function (u) { return u + "?v=" + VERSAO; });
+  const TOTAL = 35376909 + 5856928;
+  let loaded = 0;
+  const fill = document.getElementById("fill");
+  const status = document.getElementById("status");
+  const prog = (n, label) => { loaded += n; fill.style.width = Math.min(100, (loaded / TOTAL) * 100).toFixed(1) + "%"; if (label) status.textContent = label; };
+  const origFetch = window.fetch.bind(window);
+
+  async function readAll(url, label) {
+    const r = await origFetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error("falha ao baixar " + url + " (" + r.status + ")");
+    const reader = r.body.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      prog(value.length, label);
+    }
+    return new Blob(chunks);
+  }
+
+  window.fetch = async function (input, init) {
+    const url = typeof input === "string" ? input : input.url;
+    if (url && url.split("?")[0].endsWith("index.wasm")) {
+      const blobs = [];
+      for (let i = 0; i < PARTS.length; i++) blobs.push(await readAll(PARTS[i], "Baixando o motor (" + (i + 1) + "/3)"));
+      status.textContent = "Iniciando";
+      return new Response(new Blob(blobs, { type: "application/wasm" }), { headers: { "Content-Type": "application/wasm" } });
+    }
+    if (url && url.split("?")[0].endsWith("index.pck")) {
+      const b = await readAll("w/dados.wasm?v=" + VERSAO, "Baixando os dados do jogo");
+      return new Response(b, { headers: { "Content-Type": "application/octet-stream" } });
+    }
+    return origFetch(input, init);
+  };
+
+  function fail(e) {
+    status.textContent = "Não foi possível iniciar: " + (e && e.message ? e.message : e);
+  }
+
+  document.getElementById("play").addEventListener("click", function () {
+    document.getElementById("start").hidden = true;
+    document.getElementById("loading").hidden = false;
+    const s = document.createElement("script");
+    s.src = "index.js?v=" + VERSAO;
+    s.onerror = () => fail("index.js não carregou");
+    s.onload = function () {
+      try {
+        const engine = new Engine({
+          args: [], canvasResizePolicy: 0, executable: "index", experimentalVK: false,
+          fileSizes: { "index.pck": 5856928, "index.wasm": 35376909 },
+          focusCanvas: true, gdextensionLibs: [], ensureCrossOriginIsolationHeaders: false
+        });
+        engine.startGame({
+          onProgress: function (cur, tot) { if (tot > 0 && cur >= tot) status.textContent = "Iniciando"; }
+        }).then(function () {
+          document.getElementById("loading").hidden = true;
+          document.getElementById("canvas").focus();
+        }, fail);
+      } catch (e) { fail(e); }
+    };
+    document.body.appendChild(s);
+  });
+})();
+</script>
+</body>
+</html>
