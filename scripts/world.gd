@@ -129,6 +129,7 @@ func _ready() -> void:
 	Game.team_changed.connect(_on_team_changed)
 	Game.party_changed.connect(_on_party_changed)
 	Weather.attach(self)
+	Fortaleza.attach(self)   # Região 4: chefes, feixes de luz, retorno ao Refúgio
 
 func _make_tileset() -> TileSet:
 	if _tileset:
@@ -169,10 +170,12 @@ func _make_tileset() -> TileSet:
 		for i in INT_NAMES.size():
 			src3.create_tile(Vector2i(i % 16, i / 16))
 		ts.add_source(src3, 2)
+	Fortaleza.add_source(ts)   # Região 4 (fonte 4 do TileSet)
 	_tileset = ts
 	return ts
 
 func _tc(name: String) -> Vector2i:
+	if Fortaleza.is_name(name): return Fortaleza.coords(name)
 	var i := TILE_NAMES.find(name)
 	if i < 0:
 		i = MINAS_NAMES.find(name)
@@ -182,6 +185,7 @@ func _tc(name: String) -> Vector2i:
 
 ## Fonte do atlas: 0 = floresta (tiles2.png), 1 = minas (tiles_minas.png)
 func _src(name: String) -> int:
+	if Fortaleza.is_name(name): return Fortaleza.SOURCE_ID
 	if INT_NAMES.has(name):
 		return 2
 	return 1 if MINAS_NAMES.has(name) else 0
@@ -314,6 +318,7 @@ func _cell_tiles(x: int, y: int) -> Array:
 				out[0] = "chimney"
 			else:
 				out[0] = "forge_door" if x == mid2 else ("forge_window" if (x - a2) % 2 == 1 else "forge_wall")
+	if Fortaleza.CHARS.contains(c): out = Fortaleza.cell_tiles(self, x, y, c, hv)   # Região 4
 	return out
 
 func _paint_cell(i: int, j: int) -> void:
@@ -328,7 +333,7 @@ func _paint_cell(i: int, j: int) -> void:
 		cover.set_cell(Vector2i(i, j - 1), _src(t[3]), _tc(t[3]))
 
 func is_solid_char(c: String) -> bool:
-	return SOLID.contains(c)
+	return SOLID.contains(c) or Fortaleza.SOLID.contains(c)
 
 # =============================================================== CARREGAR MAPA
 ## spawn: nome do ponto de entrada; pos: posição em pixels (sobrepõe o spawn, usada por continue/checkpoint).
@@ -409,6 +414,8 @@ func _compute_tiles() -> void:
 			continue
 		if c.has("unless") and Game.has_flag(c["unless"]):
 			continue
+		if c.has("eco") and not (Game.has_eco(c["eco"]) or Game.has_flag("eco_" + str(c["eco"]))):
+			continue   # ex.: a ponte espiritual só existe para quem tem o Olhar Velado
 		for r in c.get("rects", []):
 			for j in range(int(r[3])):
 				for i in range(int(r[2])):
@@ -483,6 +490,8 @@ func _rebuild_collision() -> void:
 				i += 1
 
 func refresh_tiles() -> void:
+	if base_tiles.size() != H or cur_tiles.size() != H:
+		return     # mapa em troca (load_map limpa flags temporárias antes de ler os tiles novos)
 	var before := cur_tiles.duplicate(true)
 	_compute_tiles()
 	var changed := false
@@ -546,7 +555,7 @@ func _spawn_def(i: int, player_pos: Vector2 = Vector2(-9999, -9999)) -> void:
 		"enemy":
 			if d.has("enc") and Game.has_flag(_enc_done_flag(d["enc"])):
 				return
-			var en2 := Enemy.new()
+			var en2: Enemy = Fortaleza.new_enemy(d["kind"])
 			en2.init(self, d["kind"], d)
 			if player_pos.distance_to(en2.position) < 80.0:
 				return
@@ -573,6 +582,11 @@ func _spawn_def(i: int, player_pos: Vector2 = Vector2(-9999, -9999)) -> void:
 			bb.init(self, bk, d)
 			node = bb
 			boss_nodes[i] = bb
+		_:
+			if Fortaleza.ENT_KINDS.has(t):   # mecanismos da Região 4 (scripts/fort_ent.gd)
+				var fe := FortEnt.new()
+				fe.init(self, d)
+				node = fe
 	if node != null:
 		ysort.add_child(node)
 		ent_nodes[i] = node
@@ -607,6 +621,12 @@ func respawn_commons() -> void:
 				_spawn_def(i, player.global_position)
 
 func _on_flag_changed(name: String, _v: bool) -> void:
+	if _v and Data.story.get("memorias", {}).has(name) and not Game.has_flag("mem_" + name):
+		_memory_queue.append(name)
+	if _v:
+		for g in Data.story.get("jornada", {}).get("guardioes", []):
+			if g["flag"] == name:
+				say("Ecos dos guardiões: %d/5 — Jornada %d%% (Menu > Jornada)" % [Game.guardians_done(), Game.conquest_pct()])
 	if map.is_empty():
 		return
 	refresh_tiles()
@@ -707,7 +727,7 @@ func _spawn_contract() -> void:
 		d["contrato"] = cid
 		if not d.has("id"):
 			d["id"] = "%s_f%d_%d" % [cid, int(d["x"]), int(d["y"])]
-		var en := Enemy.new()
+		var en: Enemy = Fortaleza.new_enemy(d["kind"])
 		en.init(self, d["kind"], d)
 		ysort.add_child(en)
 		if d["kind"] == "vesna":
@@ -716,6 +736,10 @@ func _spawn_contract() -> void:
 	if boss_node != null:
 		ui.boss_bar(boss_node)
 		Audio.set_mood("chefe", true, "chefao")
+		if not test_mode:
+			player.set_busy(true)
+			ui.dialog(["Vesna: O aprendiz da vinculadora de capa azul. Ela também tentou me convencer a largar o chicote.",
+				"Vesna: Minhas feras não vão para as correntes da Catedral. Se para isso eu tiver de te derrubar... que seja."], func(): player.set_busy(false))
 
 ## Um domador do contrato caiu: as feras dele ficam livres (e podem ser capturadas); se não sobrou nenhum, o contrato termina.
 func contract_enemy_down(e: Node) -> void:
@@ -834,6 +858,7 @@ func say(text: String) -> void:
 func _physics_process(delta: float) -> void:
 	if map.is_empty() or get_tree().paused:
 		return
+	_memory_tick(delta)
 	arrival_t = max(0.0, arrival_t - delta)
 	combat_t = max(0.0, combat_t - delta)
 	Game.swap_cd = max(0.0, Game.swap_cd - delta)
@@ -1254,7 +1279,7 @@ func cell_free_for_crate(pos: Vector2, me: Node) -> bool:
 
 func reset_room_puzzles() -> void:
 	## Reinicia caixas e alavancas ainda não resolvidas (evita travar por caixa encurralada).
-	const RESET := ["crate", "lever", "flower", "plate", "cart", "furnace", "rail_lever", "brazier"]
+	var RESET: Array = ["crate", "lever", "flower", "plate", "cart", "furnace", "rail_lever", "brazier"] + Fortaleza.RESET_KINDS
 	for i in ent_defs.size():
 		var d: Dictionary = ent_defs[i]
 		if d["type"] in RESET:
@@ -1264,8 +1289,8 @@ func reset_room_puzzles() -> void:
 			ent_nodes.erase(i)
 		elif d["type"] == "valve" and (d.has("dura") or str(d.get("flag", "")).begins_with("tmp_")):
 			Game.set_flag(d["flag"], false)      # válvulas temporizadas do rito voltam a fechar
-		elif d["type"] == "rail_lever":
-			pass
+		elif d["type"] == "eclipse" and str(d.get("flag", "")).begins_with("tmp_"):
+			Game.set_flag(d["flag"], false)      # Região 4: o eclipse do rito volta ao sol
 		if d["type"] == "rail_lever":
 			rail_switch[d["id"]] = str(d.get("start", "a"))
 	for g in map.get("puzzles", {}):
@@ -1279,6 +1304,7 @@ func reset_room_puzzles() -> void:
 	for i in ent_defs.size():
 		if ent_defs[i]["type"] in RESET:
 			_spawn_def(i)
+	FortEnt.retrace(self)
 
 # =============================================================== ENCONTROS
 func _update_encounters() -> void:
@@ -1359,7 +1385,7 @@ func _vila_return_scene() -> void:
 	Game.set_flag("voltou_vila")
 	await get_tree().create_timer(0.8).timeout
 	player.set_busy(true)
-	ui.dialog(["As raízes recuaram da vila e as flores abriram por toda parte.", "A família Corvelo voltou para casa, e a passagem ao norte, para o Desfiladeiro do Eco, está aberta.",
+	ui.dialog(["As raízes recuaram da vila e as flores abriram por toda parte. Pela primeira vez em três luas, ninguém ouviu vozes à noite.", "A família Corvelo voltou para casa. Pipo corre para mostrar a todos o que você fez — e a passagem ao norte, para o Desfiladeiro do Eco, está aberta.",
 		"Só a Raiz Viva pode construir uma ponte sobre a ravina: vá até lá e aperte E no suporte marcado."], func():
 		player.set_busy(false)
 		autosave())
@@ -1383,7 +1409,8 @@ func _forja_return_scene() -> void:
 	Game.set_flag("voltou_forja")
 	await get_tree().create_timer(0.8).timeout
 	player.set_busy(true)
-	ui.dialog(["O calor bom voltou às pedras: as forjas da Forja de Cobre se acenderam outra vez.",
+	ui.dialog(["O calor bom voltou às pedras: as forjas da Forja de Cobre se acenderam outra vez. Os mineiros cantam enquanto trabalham.",
+		"No bolso, o elo partido da corrente de Ione vibra fraquinho, apontando para o sul — para os pântanos.",
 		"A família Ruivo, presa na Fundição, está de volta, e o vapor da grande forja moveu o elevador da praça leste.",
 		"Com a Ruptura Ígnea você pode quebrar rochas fissuradas — há uma no muro leste da vila — e o Rito da Forja guarda uma prova avançada."], func():
 		player.set_busy(false)
@@ -1541,6 +1568,7 @@ func fire_area(origin: Vector2, dir: Vector2, rad: float, arc: float, src: Strin
 				var ac := Game.active_ind()
 				if not ac.is_empty():
 					Game.bond_activity(ac["uuid"], "acao:" + e.eid)
+	n += FortEnt.heat_area(self, origin, dir, rad, arc)   # Região 4: mecanismos antigos
 	return n
 
 # =============================================================== ECO: RUPTURA ÍGNEA
@@ -1658,3 +1686,47 @@ func rite_altar(a: Ent) -> void:
 	ui.dialog(a.def.get("lines", ["O rito está completo."]), func():
 		player.set_busy(false)
 		autosave())
+
+
+# =============================================================== MEMÓRIAS DOS GUARDIÕES (fio da história)
+## Quando um guardião cai, uma visão do passado conta um pedaço da história e entrega uma página do Diário.
+var _memory_queue: Array = []
+var _memory_wait := 0.0
+
+func _memory_tick(delta: float) -> void:
+	if _memory_queue.is_empty():
+		_memory_wait = 0.0
+		return
+	if test_mode and not memory_in_tests:
+		for f in _memory_queue:
+			_memory_reward(f)
+		_memory_queue.clear()
+		return
+	if ui.is_modal() or ui.has_screen() or transition_busy or in_combat() or player.state == Player.S.DEAD or active_boss != null:
+		_memory_wait = 0.0
+		return
+	_memory_wait += delta
+	if _memory_wait < 1.6:
+		return
+	var f: String = _memory_queue.pop_front()
+	_memory_wait = 0.0
+	if Game.has_flag("mem_" + f):
+		return
+	var m: Dictionary = Data.story["memorias"][f]
+	Audio.mood_for("memoria", 25.0)
+	player.set_busy(true)
+	ui.banner(m["titulo"])
+	ui.dialog(m["linhas"], func():
+		player.set_busy(false)
+		_memory_reward(f))
+
+var memory_in_tests := false
+
+func _memory_reward(f: String) -> void:
+	if Game.has_flag("mem_" + f):
+		return
+	Game.set_flag("mem_" + f)
+	var it: String = str(Data.story["memorias"][f].get("item", ""))
+	if it != "" and Data.items.has(it):
+		Game.give_item(it, 1)
+		say("Diário: %s" % Data.items[it]["nome"])
