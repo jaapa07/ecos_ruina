@@ -263,7 +263,7 @@ func _update_hud() -> void:
 			_cr_icon_sp = ac["species_id"]
 		_cr_name.text = "%s %d" % [Game.creature_name(ac).left(9), ac["nivel"]]
 		_cr_hp.value = float(ac["hp"]) / Game.creature_hp_max(ac) * 1000.0
-		var sk: Dictionary = Data.skills[Game.sp_of(ac)["skill"]]
+		var sk: Dictionary = Data.skills[Game.hab_active(ac)]
 		var cd: float = float(Game.skill_cd.get(ac["uuid"], 0.0))
 		_cr_skill.text = "Q pronto" if cd <= 0.0 else "Q %.0fs" % cd
 		_cr_cd.value = (1.0 - cd / float(sk["recarga"])) * 1000.0
@@ -342,6 +342,9 @@ func _update_hud() -> void:
 		_prompt.position.x = 240.0 - w / 2.0
 		_prompt_lab.size.x = w - 8.0
 	var obj := Game.objective_text()
+	var ct := Game.contract_progress_text()
+	if ct != "":
+		obj = "[Contrato] " + ct
 	_obj_lab.text = ("Objetivo: " + obj) if obj != "" else ""
 	var hint := Game.tutorial_hint()
 	_hint.visible = hint != "" and not dlg_active

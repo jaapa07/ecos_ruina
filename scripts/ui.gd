@@ -179,7 +179,7 @@ func open_pause() -> void:
 
 func _fill_pause(s: MenuScreen) -> void:
 	var items := [
-		_it("Continuar", func(): s.close(), "Volta ao jogo."),
+		_it("Continuar", func(): s.close(), "Volta ao jogo.\n\n" + Weather.describe()),
 		_it("Equipe e criaturas", func(): open_team(), "Veja, ordene e evolua suas criaturas."),
 		_it("Inventário e herói", func(): open_inventory(), "Itens, equipamentos, talentos."),
 		_it("Bestiário", func(): open_bestiary(), "Criaturas vistas e capturadas."),
@@ -199,16 +199,19 @@ func _fill_pause(s: MenuScreen) -> void:
 # =============================================================== EQUIPE
 func creature_info(ind: Dictionary, compare: Dictionary = {}) -> String:
 	var sp := Game.sp_of(ind)
-	var sk: Dictionary = Data.skills[sp["skill"]]
+	var sk: Dictionary = Data.skills[Game.hab_active(ind)]
 	var ev := Game.evolution_status(ind)
 	var t := "%s  (%s)\nNível %d   XP %d/%d\nVida %d/%d   Ataque %.0f\nAfinidade: %s   Papel: %s\n\nHabilidade (Q): %s\n  %s\nPassiva: %s\nAção ambiental: %s\n\nVínculo: %d/3 atividades\n" % [
 		Game.creature_name(ind), sp["nome"], ind["nivel"], int(ind["xp"]), Game.creature_xp_to_next(int(ind["nivel"])),
 		int(ind["hp"]), int(Game.creature_hp_max(ind)), Game.creature_atk(ind), sp["afinidade"], sp["papel"],
 		sk["nome"], sk["descricao"], sp["passiva"], sp["acao_ambiental"], Game.bond_count(ind)]
+	t += "Habilidades aprendidas: %d/%d (menu Habilidades)\n" % [ind.get("hab_aprendidas", []).size(), Game.hab_list(ind["species_id"]).size()]
 	if sp.get("evolucao") != null:
 		t += "Evolui para %s no nível %d. %s" % [Data.sp(sp["evolucao"]["para"])["nome"], sp["evolucao"]["nivel"], "PRONTA!" if ev["possivel"] else ev["motivo"]]
 	else:
 		t += "Forma final."
+	var acc: String = str(ind.get("acessorio", ""))
+	t += "\nAcessório: %s" % (Data.items[acc]["nome"] if acc != "" and Data.items.has(acc) else "—")
 	if ind.get("exausta", false):
 		t += "\n[EXAUSTA — recupere no santuário]"
 	if not compare.is_empty():
@@ -250,11 +253,13 @@ func _creature_menu(uuid: String, parent: MenuScreen) -> void:
 	items.append(_it("Apelido…", func(): _rename(ind, func(): s.close(); _fill_team(parent)), "Dá um apelido (até 12 letras)."))
 	var ev := Game.evolution_status(ind)
 	items.append(_it("Evoluir" + ("" if ev["possivel"] else " (indisponível)"), func(): _evolve_confirm(ind, func(): s.close(); _fill_team(parent)), ev.get("motivo", "") if not ev["possivel"] else "Confirme a evolução fora de combate.", ev["possivel"] and not world.in_combat()))
+	items.append(_it("Habilidades…", func(): open_habilidades(uuid, func(): s.setup(Game.creature_name(ind), items, creature_info(ind))), "Escolha qual habilidade aprendida a criatura usa no Q (botão estrela no toque)."))
 	items.append(_it("Enviar ao santuário", func():
 		if Game.move_to_sanctuary(uuid):
 			world.refresh_companion(true); s.close(); _fill_team(parent)
 		else:
 			toast("Precisa manter ao menos uma criatura na equipe."), "Guarda no armazenamento (não recebe XP).", Game.team.size() > 1))
+	items.append(_acc_row(uuid, func(): s.close(); _fill_team(parent)))
 	items.append(_it("Voltar", func(): s.close()))
 	s.setup(Game.creature_name(ind), items, creature_info(ind))
 	for it in items:
@@ -291,14 +296,88 @@ func _evolve_confirm(ind: Dictionary, done: Callable) -> void:
 	tmp["species_id"] = ev["para"]
 	var msg := "%s evoluirá para %s.\n\nVida máx.: %d → %d\nAtaque: %.0f → %.0f\n\nMantém: identidade, apelido, vínculo, papel e ação ambiental.\nA habilidade ganha potência (×1.4)." % [Game.creature_name(ind), to["nome"], int(cur_hp), int(Game.creature_hp_max(tmp)), cur_atk, Game.creature_atk(tmp)]
 	_confirm("Evoluir criatura?", msg, func():
-		if Game.evolve(ind["uuid"]):
+		var evolved := Game.evolve(ind["uuid"])
+		if evolved:
 			Audio.play("evolve")
 			world.refresh_companion(true)
 			if world.companion != null:
 				world.companion.queue_free()
 				world.companion = null
 				world.refresh_companion(true)
-		done.call())
+		done.call()
+		if evolved and not Game.hab_novas.is_empty():
+			open_habilidades(ind["uuid"], Callable(), Game.hab_novas.duplicate()))
+
+# =============================================================== HABILIDADES DA CRIATURA (escolha da ativa)
+## Lista as aprendidas (escolher define a ativa: Q / botão estrela) e as bloqueadas com o nível necessário (cinza).
+func open_habilidades(uuid: String, done: Callable = Callable(), novas: Array = []) -> MenuScreen:
+	var ind: Dictionary = Game.individuals.get(uuid, {})
+	if ind.is_empty():
+		return null
+	Game.hab_sync(ind, false)
+	var s := _push("Habilidades", [], "")
+	if done.is_valid():
+		s.closed.connect(done)
+	s.setup("Habilidades — %s" % Game.creature_name(ind), [], "")
+	s.list_w = 200.0
+	_hab_fill(s, ind, novas)
+	# começa na habilidade ativa
+	for i in s.items.size():
+		if str(s.items[i]["t"]).begins_with("★"):
+			s.sel = i
+			break
+	s._refresh()
+	return s
+
+func _hab_fill(s: MenuScreen, ind: Dictionary, novas: Array) -> void:
+	if not is_instance_valid(s):
+		return
+	var uuid: String = ind["uuid"]
+	var items: Array = []
+	var ativa := Game.hab_active(ind)
+	var learned: Array = ind.get("hab_aprendidas", [])
+	if not novas.is_empty():
+		var nomes: Array = []
+		for h in novas:
+			nomes.append(Data.skills[h]["nome"])
+		items.append(_hdr("Nova: " + ", ".join(nomes)))
+	items.append(_hdr("Aprendidas (%d)" % learned.size()))
+	for hid in learned:
+		var h: String = hid
+		var lab := "%s%s" % ["★ " if h == ativa else "  ", Data.skills[h]["nome"]]
+		items.append(_it(lab, func():
+			if Game.hab_set_active(uuid, h):
+				Audio.play("ui_ok")
+				toast("%s usará %s no Q." % [Game.creature_name(ind), Data.skills[h]["nome"]])
+			_hab_fill(s, ind, novas), func(): return Game.hab_text(ind, h) + ("\n\n[ATIVA — usada no Q]" if h == Game.hab_active(ind) else "\n\nConfirme para usar no Q.")))
+	var locked: Array = []
+	for e in Game.hab_list(ind["species_id"]):
+		if not learned.has(str(e["id"])):
+			locked.append(e)
+	if not locked.is_empty():
+		items.append(_hdr("Bloqueadas"))
+		for e in locked:
+			var h2: String = str(e["id"])
+			var nv: int = int(e.get("nivel", 1))
+			items.append(_it("  %s  (Nv.%d)" % [Data.skills[h2]["nome"], nv], Callable(), func(): return Game.hab_text(ind, h2) + "\n\nAprende no nível %d." % nv, false))
+	var ev = Game.sp_of(ind).get("evolucao")
+	if ev != null:
+		var exclusive: Array = []
+		for e2 in Game.hab_list(str(ev["para"])):
+			if Game.hab_level(ind["species_id"], str(e2["id"])) == 0:
+				exclusive.append(e2)
+		if not exclusive.is_empty():
+			items.append(_hdr("Após evoluir (%s)" % Data.sp(ev["para"])["nome"]))
+			for e3 in exclusive:
+				var h3: String = str(e3["id"])
+				var nv3: int = int(e3.get("nivel", 1))
+				items.append(_it("  %s  (Nv.%d)" % [Data.skills[h3]["nome"], nv3], Callable(), func(): return Game.hab_text(ind, h3) + "\n\nExclusiva da forma evoluída: aprende no nível %d após evoluir." % nv3, false))
+	items.append(_it("Voltar", func(): s.close()))
+	var keep := s.sel
+	s.set_items(items)
+	s.sel = clampi(keep, 0, items.size() - 1)
+	s._fix_sel(1)
+	s._refresh()
 
 func open_storage() -> void:
 	var s := _push("Santuário", [], "")
@@ -331,6 +410,7 @@ func _storage_menu(uuid: String, refill: Callable) -> void:
 		else:
 			toast("Equipe cheia (3)."), "", Game.team.size() < 3))
 	items.append(_it("Apelido…", func(): _rename(ind, func(): s.close(); refill.call())))
+	items.append(_it("Habilidades…", func(): open_habilidades(uuid, func(): s.setup(Game.creature_name(ind), items, creature_info(ind, Game.active_ind()))), "Escolha qual habilidade aprendida a criatura usa no Q."))
 	items.append(_it("Liberar…", func():
 		var why := Game.can_release(uuid)
 		if why != "":
@@ -338,6 +418,7 @@ func _storage_menu(uuid: String, refill: Callable) -> void:
 		else:
 			_confirm("Liberar %s?" % Game.creature_name(ind), "Esta criatura será liberada para sempre. Isso não pode ser desfeito.", func():
 				Game.release(uuid); s.close(); refill.call()), "Liberta a criatura (pede confirmação)."))
+	items.append(_acc_row(uuid, func(): s.close(); refill.call()))
 	items.append(_it("Voltar", func(): s.close()))
 	s.setup(Game.creature_name(ind), items, creature_info(ind, Game.active_ind()))
 
@@ -383,6 +464,22 @@ func _fill_inventory(s: MenuScreen) -> void:
 		row["icol"] = Game.rarity_color(idd).lerp(Color.WHITE, 0.55)
 		row["icon"] = Game.item_icon(idd)
 		items.append(row)
+	var accs: Array = []
+	for ida in Data.items:
+		if Data.items[ida]["tipo"] == "acessorio_criatura" and Game.item_count(ida) > 0:
+			var idac: String = ida
+			var users: Array = []
+			for u in Game.individuals:
+				if str(Game.individuals[u].get("acessorio", "")) == idac:
+					users.append(Game.creature_name(Game.individuals[u]))
+			var ra := _it("%s%s" % [Data.items[idac]["nome"], (" x%d" % Game.item_count(idac)) if Game.item_count(idac) > 1 else ""], Callable(),
+				Data.items[idac]["desc"] + "\n\nEm uso por: " + (", ".join(users) if users.size() > 0 else "ninguém") + "\nEquipe pela tela da Equipe (escolha a criatura).")
+			ra["col"] = Game.rarity_color(idac)
+			ra["icon"] = Game.item_icon(idac)
+			accs.append(ra)
+	if not accs.is_empty():
+		items.append(_hdr("Acessórios de criatura"))
+		items.append_array(accs)
 	items.append(_hdr("Itens"))
 	for id2 in Data.items:
 		var it2: Dictionary = Data.items[id2]
@@ -542,7 +639,7 @@ func open_bestiary() -> void:
 			return "%s\nAfinidade: %s   Raridade: %s   Papel: %s\nHabitat: %s\n%s\n\nHabilidade: %s — %s\nPassiva: %s\nAção ambiental: %s\n\nVisto: sim   Capturado: %s\nEvolução: %s" % [
 				sp["nome"], sp["afinidade"], sp["raridade"], sp["papel"], sp["habitat"], sp["descricao"], skn["nome"], skn["descricao"], sp["passiva"], sp["acao_ambiental"],
 				"sim" if b.get("capturado", false) else "não",
-				("descoberta: %s (nv.%d)" % [Data.sp(evo_id)["nome"], sp["evolucao"]["nivel"]]) if evo_found else ("%s no nv.%d (não vista)" % ["???", sp["evolucao"]["nivel"]] if evo_id != "" else "—")]))
+				("descoberta: %s (nv.%d)" % [Data.sp(evo_id)["nome"], sp["evolucao"]["nivel"]]) if evo_found else ("%s no nv.%d (não vista)" % ["???", sp["evolucao"]["nivel"]] if evo_id != "" else "—")] + "\n" + Weather.species_note(sp["afinidade"])))
 	items.append(_it("Voltar", func(): s.close()))
 	s.setup("Bestiário  vistas %d • capturadas %d / %d" % [seen, cap, base_ids.size()], items, "")
 	s.list_w = 200.0
@@ -739,3 +836,128 @@ func _fill_forge(s: MenuScreen) -> void:
 	items.append(_it("Sair", func(): s.close()))
 	s.setup("Forja — fragmentos: %d" % Game.fragments, items, "Escolha o que melhorar.")
 	s.list_w = 230.0
+
+# =============================================================== CONTRATOS EM GRUPO
+func open_contracts() -> void:
+	world.player.set_busy(true)
+	var s := _push("Quadro de Contratos", [], "")
+	_fill_contracts(s)
+	s.closed.connect(func(): if world.player.state == Player.S.INTERACT and not has_screen(): world.player.set_busy(false))
+
+func _contract_info(cid: String) -> String:
+	var c: Dictionary = Data.contracts[cid]
+	var names: Array = []
+	for a in c["aliados"]:
+		names.append("%s (%s)" % [Data.allies[a]["nome"], Data.allies[a]["titulo"]])
+	var r: Dictionary = c.get("recompensa", {})
+	var its: Array = []
+	for it in r.get("itens", {}):
+		its.append("%s x%d" % [Data.items.get(it, {}).get("nome", it), int(r["itens"][it])])
+	var t := "%s — %s, nível sugerido %d\n\n%s\n\nCom você: %s\n\nRecompensa: %d fragmentos, %d XP%s" % [c["nome"], {"dupla": "DUPLA", "trio": "TRIO", "caca": "CAÇADA"}.get(c["tipo"], ""), int(c["nivel"]),
+		c["texto"], ", ".join(names) if names.size() > 0 else "ninguém (solo)", int(r.get("fragmentos", 0)), int(r.get("xp", 0)), ("\n" + ", ".join(its)) if its.size() > 0 else ""]
+	var why := Game.contract_lock_reason(cid)
+	if Game.contract_state(cid) == "bloqueado" and why != "":
+		t += "\n\n" + why
+	return t
+
+func _fill_contracts(s: MenuScreen) -> void:
+	var items: Array = []
+	items.append(_hdr("Contratos e caçadas"))
+	for cid in Data.contracts:
+		var c: Dictionary = Data.contracts[cid]
+		var stt := Game.contract_state(cid)
+		var tag: String = {"feito": "", "ativo": "> ", "bloqueado": "", "ocupado": "", "disponivel": ""}.get(stt, "")
+		var lab := "%s%s" % [tag, c["nome"]]
+		var idc: String = cid
+		var row := _it(lab, func(): _contract_pick(idc, s), func(): return _contract_info(idc), stt != "bloqueado")
+		row["icon"] = Art.region("icons_grupo", (2 if c["tipo"] != "trio" else 3) * 16, 0, 16, 16) if ResourceLoader.exists("res://assets/sprites/icons_grupo.png") else null
+		if stt == "feito":
+			row["col"] = Color(0.6, 0.9, 0.6)
+		items.append(row)
+	items.append(_hdr("Patrulha"))
+	for aid in Data.allies:
+		var al: Dictionary = Data.allies[aid]
+		var ida: String = aid
+		var on: bool = aid in Game.party
+		var ok := Game.can_recruit(aid) or on
+		var r2 := _it("%s %s — %s" % ["[no grupo]" if on else "", al["nome"], al["titulo"]], func():
+			if not (Game.can_recruit(ida) or ida in Game.party):
+				toast("Disponível depois de um contrato com %s." % Data.allies[ida]["nome"])
+				return
+			Game.toggle_party(ida)
+			Audio.play("ui_ok")
+			_fill_contracts(s), al["desc"] + ("\n\nNo grupo: aperte de novo para dispensar." if on else ("\n\nConvocar para acompanhar você." if ok else "\n\nDisponível depois de um contrato juntos.")), ok)
+		r2["icon"] = Art.region("icons_grupo", int(al["icone"]) * 16, 0, 16, 16) if ResourceLoader.exists("res://assets/sprites/icons_grupo.png") else null
+		items.append(r2)
+	items.append(_it("Voltar", func(): s.close()))
+	var keep: int = s.sel if s.sel > 0 else 1
+	s.setup("Quadro de Contratos — fragmentos: %d" % Game.fragments, items, "")
+	s.list_w = 250.0
+	s.sel = min(keep, items.size() - 1)
+
+func _contract_pick(idc: String, s: MenuScreen) -> void:
+	match Game.contract_state(idc):
+		"disponivel":
+			_confirm("Aceitar \"%s\"?" % Data.contracts[idc]["nome"], _contract_info(idc), func():
+				if Game.accept_contract(idc):
+					Audio.play("ui_ok")
+					for a in Data.contracts[idc]["aliados"]:
+						toast(Data.allies[a]["falas"]["entra"])
+				_fill_contracts(s))
+		"ativo":
+			_confirm("Desistir do contrato?", "Os aliados voltam para a vila. Você pode aceitar de novo depois.", func():
+				Game.abandon_contract()
+				_fill_contracts(s))
+		"ocupado":
+			toast("Termine o contrato ativo antes.")
+		"feito":
+			toast("Contrato já concluído.")
+		_:
+			toast(Game.contract_lock_reason(idc))
+			Audio.play("puzzle_no")
+
+# =============================================================== ACESSÓRIOS DE CRIATURA
+func _acc_row(uuid: String, done: Callable) -> Dictionary:
+	var ind: Dictionary = Game.individuals[uuid]
+	var acc: String = str(ind.get("acessorio", ""))
+	var lab := "Acessório: %s" % (Data.items[acc]["nome"] if acc != "" and Data.items.has(acc) else "—")
+	var row := _it(lab, func(): _acc_menu(uuid, done), "Equipe um acessório nesta criatura (coleira, garras, guizo...). Cada peça serve a uma criatura por vez.")
+	if acc != "" and Data.items.has(acc):
+		row["col"] = Game.rarity_color(acc)
+	return row
+
+func _acc_menu(uuid: String, done: Callable) -> void:
+	var ind: Dictionary = Game.individuals[uuid]
+	var s := _push("Acessório — " + Game.creature_name(ind), [], "")
+	var items: Array = []
+	var cur: String = str(ind.get("acessorio", ""))
+	if cur != "":
+		items.append(_it("Remover %s" % Data.items[cur]["nome"], func():
+			Game.equip_creature(uuid, ""); Audio.play("ui_back"); s.close(); done.call(), "Devolve o acessório à bolsa."))
+	var any := false
+	for id in Data.items:
+		if Data.items[id]["tipo"] != "acessorio_criatura" or Game.item_count(id) <= 0 or id == cur:
+			continue
+		any = true
+		var idd: String = id
+		var free := Game.acc_available(idd, uuid)
+		var row := _it(Data.items[idd]["nome"] + ("" if free else " (em uso)"), func():
+			if Game.equip_creature(uuid, idd):
+				Audio.play("ui_ok"); toast("%s equipou %s." % [Game.creature_name(ind), Data.items[idd]["nome"]]); s.close(); done.call()
+			else:
+				toast("Esta peça já está em outra criatura."), func(): return Data.items[idd]["desc"] + _acc_preview(ind, idd), free)
+		row["col"] = Game.rarity_color(idd)
+		row["icon"] = Game.item_icon(idd)
+		items.append(row)
+	if not any and cur == "":
+		items.append(_it("(nenhum acessório)", Callable(), "Compre na loja da Ysa, monte na Oficina ou ganhe em contratos."))
+	items.append(_it("Voltar", func(): s.close()))
+	s.setup("Acessório — " + Game.creature_name(ind), items, "")
+
+func _acc_preview(ind: Dictionary, id: String) -> String:
+	var hp0 := Game.creature_hp_max(ind); var at0 := Game.creature_atk(ind)
+	var old = ind.get("acessorio", "")
+	ind["acessorio"] = id
+	var hp1 := Game.creature_hp_max(ind); var at1 := Game.creature_atk(ind)
+	ind["acessorio"] = old
+	return "\n\nAntes:  Vida %d  Ataque %.0f\nDepois: Vida %d  Ataque %.0f" % [int(hp0), at0, int(hp1), at1]

@@ -42,6 +42,9 @@ var stats := {"kills": {}, "capturas": 0, "mortes": 0}
 var play_time := 0.0
 var difficulty := "aventura"
 var behavior := "preservar"
+var party: Array = []           # aliados humanos que acompanham o herói (máx. 2)
+var contract := ""              # contrato em grupo ativo
+signal party_changed
 var slot := 1
 
 # ---- estado de execução (não vai para o save)
@@ -55,6 +58,8 @@ var rng_override: Callable = Callable()   # testes: func() -> float
 var god_mode := false
 var last_death := {}
 var dmg_stats := {}
+var weather_lock := ""      # testes: força um clima ("sol") em vez do sorteio (ver scripts/weather.gd)
+var weather_neutral := false  # testes: clima sem efeitos de jogo (o e2e completo continua determinístico)
 
 # ---- preferências (arquivo separado)
 var prefs := {"master": 0.8, "musica": 0.6, "efeitos": 0.8, "texto": 1.0, "reduz_tremor": false, "reduz_flash": false,
@@ -148,10 +153,14 @@ func new_game(p_slot: int = 1) -> void:
 	stats = {"kills": {}, "capturas": 0, "mortes": 0}
 	play_time = 0.0
 	behavior = "preservar"
+	party = []
+	contract = ""
 	tmp_flags = {}
 	skill_cd = {}
 	swap_cd = 0.0
 	save_block = 0
+	hab_escudo_t = 0.0; hab_novas = []
+	Weather.reset()
 	hero["hp"] = hero_max_hp()
 	in_game = true
 	hero_changed.emit(); team_changed.emit(); inventory_changed.emit(); quest_changed.emit()
@@ -160,7 +169,9 @@ func to_dict() -> Dictionary:
 	return {"version": SAVE_VERSION, "hero": hero, "inventory": inventory, "fragments": fragments, "equipment": equipment, "upgrades": upgrades,
 		"individuals": individuals, "team": team, "sanctuary": sanctuary, "active_idx": active_idx, "flags": flags,
 		"chests": chests, "ecos": ecos, "eco_slots": eco_slots, "bestiary": bestiary, "location": location,
-		"checkpoint": checkpoint, "stats": stats, "play_time": play_time, "difficulty": difficulty, "behavior": behavior, "slot": slot}
+		"checkpoint": checkpoint, "stats": stats, "play_time": play_time, "difficulty": difficulty, "behavior": behavior, "slot": slot,
+		"party": party, "contract": contract,
+		"clima": Weather.to_dict()}
 
 func validate_save(d: Dictionary) -> String:
 	if int(d.get("version", -1)) != SAVE_VERSION:
@@ -190,7 +201,10 @@ func from_dict(d: Dictionary) -> bool:
 	bestiary = d.get("bestiary", {}); location = d["location"]; checkpoint = d["checkpoint"]
 	stats = d.get("stats", stats); play_time = float(d.get("play_time", 0.0)); difficulty = d.get("difficulty", "aventura")
 	behavior = d.get("behavior", "preservar"); slot = int(d.get("slot", 1))
+	party = Array(d.get("party", [])); contract = str(d.get("contract", ""))
 	tmp_flags = {}; skill_cd = {}; swap_cd = 0.0; save_block = 0
+	hab_escudo_t = 0.0; hab_novas = []
+	Weather.from_dict(d.get("clima", {}))
 	in_game = true
 	_normalize_types()
 	hero["hp"] = min(float(hero.get("hp", 1.0)), hero_max_hp())
@@ -209,6 +223,7 @@ func _normalize_types() -> void:
 	for u in individuals:
 		var ind: Dictionary = individuals[u]
 		ind["nivel"] = int(ind["nivel"])
+		hab_sync(ind, false)   # saves antigos: ativa = habilidade original, aprendidas conforme o nível
 	for k in chests.keys():
 		chests[k] = true
 	for k in upgrades.keys():
@@ -259,7 +274,7 @@ func hero_level() -> int:
 	return int(hero.get("level", 1))
 
 func hero_max_hp() -> float:
-	var hp = 100.0 + 8.0 * (hero_level() - 1) + 6.0 * hero["talents"].get("resistencia", 0)
+	var hp = 100.0 + 8.0 * (hero_level() - 1) + 6.0 * hero["talents"].get("resistencia", 0) + 12.0 * item_count("semente_vida")
 	var am: String = equipment.get("amuleto", "")
 	if am != "" and Data.items.has(am):
 		hp += float(Data.items[am].get("hp", 0)) + float(forge_bonus("amuleto", "hp")) * upgrade_level(am)
@@ -293,6 +308,19 @@ func heat_mult() -> float:
 	if am != "" and Data.items.has(am):
 		m *= float(Data.items[am].get("calor", 1.0))
 	return m
+
+# =============================================================== CLIMA (regras em scripts/weather.gd)
+## Dano causado por quem tem a afinidade `aff` sob o clima atual.
+func weather_mult(aff: String) -> float:
+	return Weather.dmg_mult(aff)
+
+## Velocidade de criaturas com a afinidade `aff` (neve/frio deixam mais lentas).
+func weather_speed_mult(aff: String) -> float:
+	return Weather.speed_mult(aff)
+
+## Recuperação de vigor do herói (onda de calor cansa).
+func weather_vigor_mult() -> float:
+	return Weather.vigor_mult()
 
 # =============================================================== FORJA (melhoria de equipamento)
 func upgrade_level(id: String) -> int:
@@ -424,6 +452,7 @@ func new_individual(species_id: String, level: int) -> Dictionary:
 	var ind := {"uuid": new_uuid(), "species_id": species_id, "apelido": "", "nivel": level, "xp": 0, "hp": 1.0,
 		"exausta": false, "vinculo": [], "origem": ""}
 	ind["hp"] = creature_hp_max(ind)
+	hab_sync(ind, false)
 	return ind
 
 func sp_of(ind: Dictionary) -> Dictionary:
@@ -431,11 +460,46 @@ func sp_of(ind: Dictionary) -> Dictionary:
 
 func creature_hp_max(ind: Dictionary) -> float:
 	var s := sp_of(ind)
-	return floor(float(s.get("hp_base", 30)) + float(s.get("hp_cresc", 4)) * (int(ind["nivel"]) - 1))
+	var hp: float = float(s.get("hp_base", 30)) + float(s.get("hp_cresc", 4)) * (int(ind["nivel"]) - 1) + acc_stat(ind, "hp")
+	return floor(hp * (1.0 + acc_stat(ind, "mult")))
 
 func creature_atk(ind: Dictionary) -> float:
 	var s := sp_of(ind)
-	return float(s.get("atk_base", 5)) + float(s.get("atk_cresc", 1)) * (int(ind["nivel"]) - 1)
+	var a: float = float(s.get("atk_base", 5)) + float(s.get("atk_cresc", 1)) * (int(ind["nivel"]) - 1) + acc_stat(ind, "atk")
+	return a * (1.0 + acc_stat(ind, "mult"))
+
+# ---- acessórios de criatura (um por criatura)
+func acc_stat(ind: Dictionary, key: String) -> float:
+	var id: String = str(ind.get("acessorio", ""))
+	if id == "" or not Data.items.has(id):
+		return 0.0
+	return float(Data.items[id].get(key, 0.0))
+
+func creature_cd_mult(ind: Dictionary) -> float:
+	return max(0.4, 1.0 - acc_stat(ind, "cd"))
+
+func acc_in_use(id: String, except_uuid := "") -> int:
+	var n := 0
+	for u in individuals:
+		if u != except_uuid and str(individuals[u].get("acessorio", "")) == id:
+			n += 1
+	return n
+
+func acc_available(id: String, for_uuid := "") -> bool:
+	return item_count(id) > acc_in_use(id, for_uuid)
+
+func equip_creature(uuid: String, id: String) -> bool:
+	var ind: Dictionary = individuals.get(uuid, {})
+	if ind.is_empty():
+		return false
+	if id != "" and not acc_available(id, uuid):
+		return false
+	var frac: float = float(ind["hp"]) / max(1.0, creature_hp_max(ind))
+	ind["acessorio"] = id
+	if not ind.get("exausta", false):
+		ind["hp"] = max(1.0, floor(creature_hp_max(ind) * frac))
+	team_changed.emit()
+	return true
 
 func creature_name(ind: Dictionary) -> String:
 	if ind.get("apelido", "") != "":
@@ -534,6 +598,7 @@ func set_active(uuid: String) -> void:
 		team_changed.emit()
 
 func damage_creature(ind: Dictionary, amount: float) -> void:
+	amount *= 1.0 - acc_stat(ind, "red")
 	ind["hp"] = max(0.0, float(ind["hp"]) - amount)
 	if float(ind["hp"]) <= 0.0:
 		ind["exausta"] = true
@@ -567,13 +632,14 @@ func revive_creature(uuid: String) -> bool:
 func add_creature_xp(ind: Dictionary, amount: float) -> void:
 	if int(ind["nivel"]) >= CREATURE_MAX_LEVEL:
 		return
-	ind["xp"] = float(ind["xp"]) + amount
+	ind["xp"] = float(ind["xp"]) + amount * (1.0 + acc_stat(ind, "xp"))
 	while int(ind["nivel"]) < CREATURE_MAX_LEVEL and float(ind["xp"]) >= creature_xp_to_next(int(ind["nivel"])):
 		ind["xp"] = float(ind["xp"]) - creature_xp_to_next(int(ind["nivel"]))
 		ind["nivel"] = int(ind["nivel"]) + 1
 		var frac: float = float(ind["hp"]) / max(1.0, creature_hp_max(ind))
 		toast.emit("%s chegou ao nível %d!" % [creature_name(ind), ind["nivel"]])
 		level_up.emit(ind["uuid"], int(ind["nivel"]))
+		hab_sync(ind, true)
 		check_evolution_hint(ind)
 		if not ind.get("exausta", false):
 			ind["hp"] = min(creature_hp_max(ind), float(ind["hp"]) + creature_hp_max(ind) * 0.25)
@@ -645,8 +711,124 @@ func evolve(uuid: String) -> bool:
 	b["visto"] = true; b["evoluiu"] = true
 	bestiary[ind["species_id"]] = b
 	toast.emit("%s evoluiu para %s!" % [creature_name(ind), Data.sp(ind["species_id"]).get("nome", "")])
+	hab_novas = hab_sync(ind, true)
 	team_changed.emit()
 	return true
+
+# =============================================================== HABILIDADES DAS CRIATURAS (aprendidas por nível; o jogador escolhe a ativa)
+## Cada espécie lista "habilidades": [{"id", "nivel"}]; a forma evoluída repete as da base e libera exclusivas.
+## Cada indivíduo guarda "hab_aprendidas" (ids) e "hab_ativa" (a usada no Q / botão estrela).
+const HAB_FATOR := {"prender": 0.4, "pulso": 0.5, "ima": 0.4, "nuvem": 0.3}
+var hab_escudo_t := 0.0      # execução: escudo ativo (herói e criatura recebem menos dano)
+var hab_escudo_red := 0.0
+var hab_novas: Array = []    # habilidades liberadas na última evolução (a UI oferece a escolha)
+
+func hab_list(species_id: String) -> Array:
+	var s: Dictionary = Data.sp(species_id)
+	var l = s.get("habilidades", [])
+	if l is Array and not l.is_empty():
+		return l
+	if str(s.get("skill", "")) != "":
+		return [{"id": s["skill"], "nivel": 1}]
+	return []
+
+func hab_default(ind: Dictionary) -> String:
+	return str(sp_of(ind).get("skill", ""))
+
+## Garante os campos e aprende o que o nível permite. Devolve as recém-aprendidas (avisa por toast se announce).
+func hab_sync(ind: Dictionary, announce: bool) -> Array:
+	if ind.is_empty() or not ind.has("species_id"):
+		return []
+	var learned: Array = []
+	var old = ind.get("hab_aprendidas", null)
+	var had_list: bool = old is Array
+	if had_list:
+		for h in old:
+			if Data.skills.has(str(h)) and not learned.has(str(h)):
+				learned.append(str(h))
+	var novas: Array = []
+	for h in hab_list(str(ind["species_id"])):
+		var hid := str(h.get("id", ""))
+		if Data.skills.has(hid) and int(h.get("nivel", 1)) <= int(ind.get("nivel", 1)) and not learned.has(hid):
+			learned.append(hid)
+			if had_list:
+				novas.append(hid)
+	ind["hab_aprendidas"] = learned
+	var act := str(ind.get("hab_ativa", ""))
+	if act == "" or not learned.has(act):
+		var df := hab_default(ind)
+		ind["hab_ativa"] = df if (learned.has(df) or learned.is_empty()) else str(learned[0])
+	if announce and in_game:
+		for hid in novas:
+			toast.emit("%s aprendeu %s! Escolha no menu" % [creature_name(ind), Data.skills[hid]["nome"]])
+	return novas
+
+## Habilidade usada no Q (sempre válida para a espécie atual).
+func hab_active(ind: Dictionary) -> String:
+	var a := str(ind.get("hab_ativa", ""))
+	if a != "" and Data.skills.has(a) and ind.get("hab_aprendidas", []).has(a):
+		return a
+	return hab_default(ind)
+
+func hab_set_active(uuid: String, hid: String) -> bool:
+	var ind: Dictionary = individuals.get(uuid, {})
+	if ind.is_empty():
+		return false
+	hab_sync(ind, false)
+	if not ind["hab_aprendidas"].has(hid):
+		return false
+	ind["hab_ativa"] = hid
+	team_changed.emit()
+	return true
+
+## Nível exigido para a habilidade nesta espécie (0 = não faz parte da lista).
+func hab_level(species_id: String, hid: String) -> int:
+	for h in hab_list(species_id):
+		if str(h.get("id", "")) == hid:
+			return int(h.get("nivel", 1))
+	return 0
+
+func hab_mult(ind: Dictionary) -> float:
+	return 1.4 if str(sp_of(ind).get("habitat", "")).begins_with("Evolução") else 1.0
+
+## Dano por alvo (mesma conta que o companheiro usa ao executar).
+func hab_damage(ind: Dictionary, hid: String) -> float:
+	var sk: Dictionary = Data.skills.get(hid, {})
+	var base: float = (float(sk.get("dano", 0)) + creature_atk(ind) * 0.6) * hab_mult(ind)
+	return base * float(HAB_FATOR.get(str(sk.get("exec", hid)), 1.0))
+
+func hab_heal(ind: Dictionary, hid: String) -> float:
+	var sk: Dictionary = Data.skills.get(hid, {})
+	return (float(sk.get("cura", 0)) + creature_atk(ind) * 0.5) * hab_mult(ind)
+
+## Texto da habilidade para os menus.
+func hab_text(ind: Dictionary, hid: String) -> String:
+	var sk: Dictionary = Data.skills.get(hid, {})
+	var t := "%s\n%s\n\nRecarga: %.0f s" % [sk.get("nome", hid), sk.get("descricao", ""), float(sk.get("recarga", 0))]
+	var ex := str(sk.get("exec", hid))
+	if ex == "cura":
+		t += "\nCura: %d" % int(round(hab_heal(ind, hid)))
+	elif ex == "escudo":
+		t += "\nReduz dano: %d%% por %.0f s" % [int(round(float(sk.get("reducao", 0)) * 100.0)), float(sk.get("duracao", 0))]
+	if float(sk.get("dano", 0)) > 0.0 or not (ex in ["cura", "escudo"]):
+		t += "\nDano: %d por alvo" % int(round(hab_damage(ind, hid)))
+	return t
+
+func hab_shield(dur: float, red: float) -> void:
+	if hab_escudo_t <= 0.0:
+		hab_escudo_red = 0.0
+	hab_escudo_red = max(hab_escudo_red, red)
+	hab_escudo_t = max(hab_escudo_t, dur)
+
+## Multiplicador de dano recebido pelo herói/criatura com escudo ativo.
+func hab_shield_mult() -> float:
+	return 1.0 - hab_escudo_red if hab_escudo_t > 0.0 else 1.0
+
+func hab_tick(delta: float) -> void:
+	if hab_escudo_t > 0.0:
+		hab_escudo_t = max(0.0, hab_escudo_t - delta)
+		if hab_escudo_t <= 0.0:
+			hab_escudo_red = 0.0
 
 # ---- santuário (armazenamento)
 func move_to_team(uuid: String) -> bool:
@@ -784,6 +966,7 @@ func has_eco(id: String) -> bool:
 # =============================================================== MISSÕES / DIÁRIO
 func register_kill(kind: String) -> void:
 	stats["kills"][kind] = int(stats["kills"].get(kind, 0)) + 1
+	_hunt_progress(kind)
 	if has_flag("quest_esporos") and int(stats["kills"].get("cogumelo", 0)) >= 3 and not has_flag("esporos_ok"):
 		set_flag("esporos_ok")
 		toast.emit("Missão: 3 Cogumelos derrotados! Fale com Ysa.")
@@ -1016,3 +1199,120 @@ func check_item_steps() -> void:
 			if st.has("item") and not has_flag(st["flag"]) and item_count(st["item"]) >= int(st["alvo"]):
 				set_flag(st["flag"])
 				toast.emit("Missão: %s (%d/%d) — volte para entregar." % [Data.items[st["item"]]["nome"], int(st["alvo"]), int(st["alvo"])])
+
+
+# =============================================================== CONTRATOS EM GRUPO (dupla / trio)
+const PARTY_MAX := 2
+
+func contract_state(cid: String) -> String:
+	## "feito", "ativo", "bloqueado", "ocupado" (outro contrato ativo) ou "disponivel"
+	var c: Dictionary = Data.contracts.get(cid, {})
+	if c.is_empty():
+		return "bloqueado"
+	if has_flag(cid + "_ok"):
+		return "feito"
+	if contract == cid:
+		return "ativo"
+	for f in c.get("requer", []):
+		if not has_flag(f):
+			return "bloqueado"
+	if contract != "":
+		return "ocupado"
+	return "disponivel"
+
+func contract_lock_reason(cid: String) -> String:
+	var c: Dictionary = Data.contracts[cid]
+	for f in c.get("requer", []):
+		if not has_flag(f):
+			if f.ends_with("_ok"):
+				return "Conclua antes: " + Data.contracts.get(f.trim_suffix("_ok"), {}).get("nome", f)
+			if f.begins_with("visitou_"):
+				var m: String = f.trim_prefix("visitou_")
+				return "Visite antes: " + Data.maps.get(m, {}).get("name", m)
+			return "Ainda não disponível"
+	return ""
+
+func accept_contract(cid: String) -> bool:
+	if contract_state(cid) != "disponivel":
+		return false
+	contract = cid
+	party = (Data.contracts[cid]["aliados"] as Array).duplicate()
+	hero["caca_n"] = 0
+	set_flag("contrato_" + cid)
+	party_changed.emit()
+	quest_changed.emit()
+	toast.emit("Contrato aceito: %s (%s)" % [Data.contracts[cid]["nome"], {"dupla": "Dupla", "trio": "Trio", "caca": "Caçada"}.get(Data.contracts[cid]["tipo"], "")])
+	return true
+
+func abandon_contract() -> void:
+	if contract == "":
+		return
+	set_flag("contrato_" + contract, false)
+	contract = ""
+	party = []
+	party_changed.emit()
+	quest_changed.emit()
+
+func complete_contract(cid: String) -> void:
+	if has_flag(cid + "_ok"):
+		return
+	var c: Dictionary = Data.contracts[cid]
+	set_flag(cid + "_ok")
+	set_flag("contrato_" + cid, false)
+	var r: Dictionary = c.get("recompensa", {})
+	fragments += int(r.get("fragmentos", 0))
+	add_hero_xp(int(r.get("xp", 0)))
+	for u in team:
+		if individuals.has(u):
+			add_creature_xp(individuals[u], float(r.get("xp", 0)) * 0.6)
+	for it in r.get("itens", {}):
+		give_item(it, int(r["itens"][it]))
+	stats["contratos"] = int(stats.get("contratos", 0)) + 1
+	contract = ""
+	toast.emit("Contrato concluído: %s! +%d fragmentos" % [c["nome"], int(r.get("fragmentos", 0))])
+	inventory_changed.emit()
+	quest_changed.emit()
+
+## Depois do primeiro contrato, os aliados podem ser convocados para patrulhar junto (fora de contratos).
+func can_recruit(aid: String) -> bool:
+	return contract == "" and (has_flag("saqueadores_ok") if aid == "bruna" else has_flag("emboscada_ok"))
+
+func toggle_party(aid: String) -> void:
+	if aid in party:
+		party.erase(aid)
+	elif party.size() < PARTY_MAX:
+		party.append(aid)
+	party_changed.emit()
+
+
+# =============================================================== ITENS-CHAVE
+func flask_ready() -> bool:
+	return item_count("frasco_seiva") > int(hero.get("frascos_usados", 0))
+
+func use_flask() -> void:
+	hero["frascos_usados"] = int(hero.get("frascos_usados", 0)) + 1
+
+func refill_flasks() -> void:
+	hero["frascos_usados"] = 0
+
+## Caçadas (contratos solo): contam abates do tipo pedido desde que o contrato foi aceito.
+func _hunt_progress(kind: String) -> void:
+	if contract == "" or not Data.contracts.has(contract):
+		return
+	var c: Dictionary = Data.contracts[contract]
+	if c.get("tipo", "") != "caca" or c["alvo"]["kind"] != kind:
+		return
+	hero["caca_n"] = int(hero.get("caca_n", 0)) + 1
+	var n: int = int(hero["caca_n"]); var q: int = int(c["alvo"]["qtd"])
+	if n >= q:
+		complete_contract(contract)
+	else:
+		toast.emit("%s: %d/%d" % [c["nome"], n, q])
+
+func contract_progress_text() -> String:
+	if contract == "" or not Data.contracts.has(contract):
+		return ""
+	var c: Dictionary = Data.contracts[contract]
+	if c.get("tipo", "") == "caca":
+		return "%s (%d/%d)" % [c["objetivo"], int(hero.get("caca_n", 0)), int(c["alvo"]["qtd"])]
+	return c["objetivo"]

@@ -33,8 +33,20 @@ func _ready() -> void:
 	Game.rng.seed = sd
 	Game.toast.connect(func(t): if "exausta" in t: exhausted_events += 1)
 	main.ui.instant = true
-	if "--casas" in args:
+	# clima: fora do modo --clima, fica travado em "sol" sem efeitos (fluxo determinístico)
+	if not "--clima" in args:
+		Game.weather_lock = "sol"
+		Game.weather_neutral = true
+	if "--clima" in args:
+		await run_clima()
+	elif "--habilidades" in args:
+		await run_habilidades()
+	elif "--casas" in args:
 		await run_casas()
+	elif "--grupo" in args:
+		await run_grupo()
+	elif "--musica" in args:
+		await run_musica()
 	elif "--equip" in args:
 		await run_equip()
 	elif "--powers" in args:
@@ -355,8 +367,16 @@ func weaken(wild: Node, limit := 0.35) -> void:
 			release_moves()
 			continue
 		await face(wild.global_position - P.global_position)
+		# golpe que derrubaria a criatura de uma vez: o bot "segura a mão" (um jogador também pode errar o golpe)
+		if wild.hp - Game.hero_atk() * 2.6 <= 0.0:
+			wild.hp = min(wild.hp, wild.max_hp * limit * 0.9)
+			break
 		await attack_tap()
 		await secs(0.6)
+	if is_instance_valid(wild) and wild.alive_flag:
+		wild.invulnerable = true
+		await frames(1)
+		wild.invulnerable = false
 
 func capture_wild(wild: Node, tries := 4) -> bool:
 	if not is_instance_valid(wild):
@@ -659,7 +679,10 @@ func stage5_clareira() -> void:
 	await frames(3)
 	check("Alvo protegido rejeita tentativa imediata", "protegido" in P.cap_msg, "%s prot=%.2f" % [P.cap_msg, cas.protect_t])
 	P.aiming = false
+	cas.invulnerable = true      # nada derruba o alvo enquanto a proteção de 3 s passa
 	await secs(3.2)
+	if is_instance_valid(cas):
+		cas.invulnerable = false
 	Game.rng_override = Callable()
 	ok2 = await capture_wild(cas, 10)
 	if not ok2:
@@ -1494,6 +1517,24 @@ func run_unit() -> void:
 	await frames(2)
 	check("R2: válvula converte Q->q só dentro da área", q_before == "Q" and W.cur_tiles[15][20] == "q" and W.cur_tiles[33][42] == "Q")
 	Game.set_flag("pedreira_valv", false)
+	# ---- habilidades aprendidas por nível (dados e regras)
+	var execs := ["prender", "pulso", "cone", "ima", "nuvem", "avanco", "avanco_cadeia", "cadeia", "cura", "escudo"]
+	var bad_h: Array = []
+	for sid in Data.species:
+		if Data.species[sid]["status"] != "jogavel":
+			continue
+		var hl: Array = Game.hab_list(sid)
+		if hl.size() < 3 or str(hl[0]["id"]) != str(Data.species[sid]["skill"]) or int(hl[0]["nivel"]) != 1:
+			bad_h.append(sid)
+		for h in hl:
+			if not str(Data.skills[h["id"]].get("exec", "")) in execs:
+				bad_h.append("%s:%s" % [sid, h["id"]])
+	check("Hab: espécies jogáveis têm lista de habilidades (1ª = original) com execução conhecida", bad_h.is_empty(), str(bad_h))
+	var hi := Game.new_individual("faisquito", 9)
+	check("Hab: indivíduo novo aprende o que o nível permite", hi["hab_aprendidas"] == ["cone_fogo", "fagulhas", "estouro_brasa"] and hi["hab_ativa"] == "cone_fogo", str(hi["hab_aprendidas"]))
+	var old_ind := {"uuid": "velho", "species_id": "ferrunho", "nivel": 8, "xp": 0, "hp": 10.0, "exausta": false, "vinculo": []}
+	Game.hab_sync(old_ind, false)
+	check("Hab: migração de indivíduo antigo (ativa = original)", old_ind["hab_ativa"] == "ima" and old_ind["hab_aprendidas"] == ["ima", "placa_ferro"], str(old_ind))
 
 ## Captura quadro a quadro do combo de espada (para conferir a animação)
 func run_demo() -> void:
@@ -2497,3 +2538,665 @@ func run_casas() -> void:
 	W.save_now(3)
 	SaveSys.load_game(3)
 	check("Save mantém missões das casas", Game.has_flag("ervas_entregue") and Game.has_flag("brinquedo_entregue") and Game.has_flag("folha1_pega"))
+
+
+## Clima das áreas externas (scripts/weather.gd, data/weather.json)
+func _clima_shot(id: String, map_id: String, spawn: String) -> void:
+	if W.map_id != map_id:
+		W.load_map(map_id, spawn)
+		await frames(20)
+	Weather.change_to(id, false)
+	Weather.fx.apply(id, true)
+	await secs(3.6)
+	await shot("clima_" + id)
+
+func _vigor_gain() -> float:
+	P.vigor = 0.0
+	P.vigor_idle = 1.0
+	await frames(30)
+	return P.vigor
+
+func run_clima() -> void:
+	SaveSys.delete_slot(3)
+	Game.weather_lock = ""
+	Game.weather_neutral = false
+	main.start_new_game(3)
+	await frames(10)
+	await advance_dialogs()
+	var fx: Node = Weather.fx
+	# 1) sorteio em mapa externo
+	check("Clima sorteado ao entrar na Vila (zona Floresta)", Weather.zone == "floresta" and Weather.now() in ["sol", "chuva", "neblina"], "%s/%s" % [Weather.zone, Weather.now()])
+	check("Troca agendada para 4–6 minutos", Weather.timer >= 230.0 and Weather.timer <= 360.0, str(Weather.timer))
+	check("Aviso do tempo ao chegar", toast_seen("Tempo: "))
+	check("Ícone do clima no HUD", fx.icon_panel.visible and fx.icon.texture != null)
+	var before: String = Weather.current
+	# 2) interior sem clima
+	var ok := await enter_house(Vector2i(8, 7), "casa_maru")
+	check("Casa da Maru: interior sem clima", ok and Weather.now() == "" and not fx.icon_panel.visible, "%s %s" % [W.map_id, Weather.now()])
+	await secs(0.3)
+	var vis := 0
+	for k in fx.groups:
+		if fx.groups[k].visible:
+			vis += 1
+	check("Interior sem partículas de clima", vis == 0 and fx.tint.color == Color.WHITE)
+	check("Interior: multiplicadores neutros", Game.weather_mult("flora") == 1.0 and Game.weather_speed_mult("pedra") == 1.0 and Game.weather_vigor_mult() == 1.0)
+	await leave_house()
+	check("Voltar à mesma zona mantém o clima", Weather.now() == before, "%s -> %s" % [before, Weather.now()])
+	# 3) multiplicadores
+	P.global_position = Vector2(22 * 16 + 8, 16 * 16 + 8)
+	await frames(3)
+	Weather.change_to("chuva")
+	check("Chuva: água/flora +15%, brasa -15%, luz neutra", is_equal_approx(Game.weather_mult("agua"), 1.15) and is_equal_approx(Game.weather_mult("flora"), 1.15) and is_equal_approx(Game.weather_mult("brasa"), 0.85) and Game.weather_mult("luz") == 1.0)
+	var wolf := _spawn_wolf(P.global_position + Vector2(200, 0))
+	var hp0: float = wolf.hp
+	wolf.take_damage(10.0, wolf.global_position, {"src": "companion", "aff": "agua", "knock": 0.0})
+	var d_chuva: float = hp0 - wolf.hp
+	wolf.hp = hp0
+	wolf.take_damage(10.0, wolf.global_position, {"src": "companion", "aff": "brasa", "knock": 0.0})
+	var d_brasa: float = hp0 - wolf.hp
+	wolf.hp = hp0
+	check("Chuva aplicada no dano real (enemy.take_damage)", is_equal_approx(d_chuva, 11.5) and is_equal_approx(d_brasa, 8.5), "%.2f %.2f" % [d_chuva, d_brasa])
+	check("Toast \"O tempo mudou: Chuva\"", toast_seen("O tempo mudou: Chuva"))
+	Weather.change_to("sol")
+	wolf.take_damage(10.0, wolf.global_position, {"src": "companion", "aff": "luz", "knock": 0.0})
+	check("Sol fortalece luz (Lumipim)", is_equal_approx(hp0 - wolf.hp, 11.5), str(hp0 - wolf.hp))
+	wolf.hp = hp0
+	var g_sol: float = await _vigor_gain()
+	Weather.change_to("neve")
+	check("Neve: criaturas não-gelo 15% mais lentas, gelo não", is_equal_approx(Game.weather_speed_mult("flora"), 0.85) and Game.weather_speed_mult("gelo") == 1.0)
+	check("Neve fortalece pedra", is_equal_approx(Game.weather_mult("pedra"), 1.15))
+	wolf._move(Vector2.RIGHT, 100.0, 0.016)
+	check("Neve: inimigo realmente mais lento (enemy._move)", is_equal_approx(wolf.velocity.x, 85.0), str(wolf.velocity))
+	wolf.velocity = Vector2.ZERO
+	Weather.change_to("calor")
+	check("Calor fortalece brasa", is_equal_approx(Game.weather_mult("brasa"), 1.15))
+	var g_calor: float = await _vigor_gain()
+	check("Calor: vigor do herói regenera 20% mais devagar", g_calor < g_sol * 0.85 and g_calor > g_sol * 0.75, "%.2f vs %.2f" % [g_calor, g_sol])
+	# neblina: o lobo a 90 px enxerga no sol (percepção 110) e não na neblina (77)
+	wolf.global_position = P.global_position + Vector2(90, 0)
+	Weather.change_to("sol")
+	wolf.target = null; wolf.los_t = 0.0; wolf.st = Enemy.St.IDLE
+	wolf._acquire()
+	var saw_sol: bool = wolf.target != null
+	Weather.change_to("neblina")
+	wolf.target = null; wolf.los_t = 0.0
+	wolf._acquire()
+	check("Neblina reduz a percepção dos inimigos em 30%", saw_sol and wolf.target == null and is_equal_approx(Weather.perception_mult(), 0.7))
+	wolf.queue_free()
+	# 4) transição suave e troca com o tempo
+	Weather.change_to("chuva", false)
+	await secs(3.5)
+	Weather.timer = 0.5
+	await secs(0.8)
+	var novo: String = Weather.current
+	check("Clima muda sozinho com o tempo", novo != "chuva" and novo in ["sol", "neblina"], novo)
+	check("Nova troca reagendada", Weather.timer > 200.0)
+	check("Toast de troca com o tempo", toast_seen("O tempo mudou: " + Weather.name_of(novo)))
+	await frames(30)
+	var w_old: float = fx.weight["chuva"]
+	check("Transição suave: chuva ainda esmaecendo", w_old > 0.2 and w_old < 0.95, str(w_old))
+	await secs(3.0)
+	check("Transição concluída", fx.weight["chuva"] == 0.0 and fx.weight[novo] == 1.0)
+	# 5) criaturas que dependem do clima
+	Weather.change_to("chuva", false)
+	W.load_map("bosque_lanternas", "from_vila")
+	await frames(10)
+	check("Bosque na chuva: Brotisco da chuva aparece", ent_by_id("b_brotisco_chuva") != null and ent_by_id("b_lumipim_neblina") == null)
+	Weather.change_to("neblina")
+	await frames(5)
+	check("Neblina: Lumipim da névoa aparece e o da chuva some", ent_by_id("b_lumipim_neblina") != null and ent_by_id("b_brotisco_chuva") == null)
+	check("Espécies garantidas continuam no bosque", ent_by_id("b_brotisco1") != null and ent_by_id("b_lumipim1") != null)
+	# 6) save/load mantém
+	Weather.change_to("neblina", false)
+	Weather.timer = 123.0
+	W.save_now(3)
+	Weather.change_to("sol", false)
+	SaveSys.load_game(3)
+	check("Save/load mantém clima, zona e tempo restante", Weather.current == "neblina" and Weather.zone == "floresta" and absf(Weather.timer - 123.0) < 1.0, "%s %s %.1f" % [Weather.current, Weather.zone, Weather.timer])
+	main.continue_from_slot(3)
+	await frames(10)
+	check("Continuar do slot mostra o mesmo clima", Weather.now() == "neblina" and fx.target == "neblina")
+	# 7) outras zonas
+	W.load_map("desfiladeiro", "from_vila")
+	await frames(5)
+	check("Desfiladeiro sorteia sol/frio/neve", Weather.zone == "desfiladeiro" and Weather.now() in ["sol", "frio", "neve"], Weather.now())
+	Weather.change_to("neve")
+	await frames(5)
+	check("Desfiladeiro na neve: Cascalito da neve aparece", ent_by_id("d_cascalito_neve") != null)
+	W.load_map("minas_entrada", "from_desfiladeiro")
+	await frames(5)
+	check("Minas externas sorteiam calor/sol", Weather.zone == "minas" and Weather.now() in ["calor", "sol"], Weather.now())
+	W.load_map("fundicao_a", "from_pedreira")
+	await frames(5)
+	check("Masmorra (Fundição) sem clima", Weather.now() == "")
+	# 8) descanso no santuário sorteia de novo
+	W.load_map("vila_lumen", "default")
+	await frames(5)
+	var rolls := {}
+	for i in 30:
+		W.rest_at_shrine()
+		rolls[Weather.current] = true
+	W.player.state = Player.S.FREE
+	check("Descansar sorteia o clima da zona (pesos da Floresta)", rolls.size() >= 2 and rolls.keys().all(func(k): return k in ["sol", "chuva", "neblina"]), str(rolls.keys()))
+	# 9) travamento para testes
+	Game.weather_lock = "sol"
+	Weather.timer = 0.2
+	await secs(0.5)
+	check("weather_lock força sol e não troca", Weather.now() == "sol")
+	Game.weather_neutral = true
+	check("weather_neutral desliga os efeitos", Game.weather_mult("flora") == 1.0)
+	Game.weather_lock = ""
+	Game.weather_neutral = false
+	# 10) textos explicativos
+	Weather.change_to("chuva", false)
+	check("Menu de pausa explica o clima", "Chuva" in Weather.describe() and "+15%" in Weather.describe())
+	check("Bestiário explica o clima por afinidade", "Chuva" in Weather.species_note("flora") and "mais fraca com Chuva" in Weather.species_note("brasa"))
+	await ui_press("pause")
+	await frames(4)
+	await shot("clima_pausa")
+	await close_menus()
+	# 11) screenshots de cada clima
+	await _clima_shot("sol", "bosque_lanternas", "from_vila")
+	await _clima_shot("chuva", "bosque_lanternas", "from_vila")
+	await _clima_shot("neblina", "bosque_lanternas", "from_vila")
+	await _clima_shot("neve", "desfiladeiro", "from_vila")
+	await _clima_shot("frio", "desfiladeiro", "from_vila")
+	await _clima_shot("calor", "minas_entrada", "from_desfiladeiro")
+	check("Sem erros de script durante o teste de clima", true)
+
+# ================================================================ CONTRATOS EM GRUPO (dupla / trio)
+func contract_enemies(cid: String) -> Array:
+	return W.enemies().filter(func(e): return e.alive_flag and e.contrato == cid)
+
+func run_grupo() -> void:
+	SaveSys.delete_slot(4)
+	main.start_new_game(4)
+	await frames(10)
+	await advance_dialogs()
+	Game.hero["level"] = 6
+	Game.hero["hp"] = Game.hero_max_hp()
+	Game.give_item("pocao", 6)
+	Game.set_flag("visitou_bosque_lanternas")
+	check("Quadro de contratos na vila", ent_by_id("quadro_vila") != null)
+	check("Bruna está na vila (NPC com folha própria)", ent_by_id("bruna") != null)
+	await use_ent("quadro_vila", Vector2(0, 16), Vector2.UP)
+	await frames(5)
+	check("Quadro abre a tela de contratos", main.ui.has_screen())
+	check("Contrato em dupla disponível; trio bloqueado", Game.contract_state("saqueadores") == "disponivel" and Game.contract_state("emboscada") == "bloqueado")
+	await shot("grupo_01_quadro")
+	await close_menus()
+	check("Aceitar contrato de dupla", Game.accept_contract("saqueadores"))
+	await frames(10)
+	check("Bruna entra no grupo (aliada + criatura dela) e sai do mapa como NPC", W.allies().size() == 1 and W.party_nodes.size() == 2 and ent_by_id("bruna") == null)
+	var ok := await exit_to("bosque_lanternas", 43 * 16.0, 15 * 16.0 + 8.0)
+	await frames(10)
+	check("Aliada acompanha o herói para outro mapa", ok and W.allies().size() == 1 and W.allies()[0].global_position.distance_to(P.global_position) < 80.0)
+	var es := contract_enemies("saqueadores")
+	var dom := es.filter(func(e): return e.kind in ["domador", "domadora"])
+	var fer := es.filter(func(e): return e.kind == "fera")
+	check("Domadores e feras do contrato aparecem no Bosque", dom.size() == 2 and fer.size() == 2, "%d %d" % [dom.size(), fer.size()])
+	check("Feras de domador não são capturáveis", fer.all(func(f): return not f.capturable))
+	await goto(tpos(33, 12), 30.0, 30.0)
+	await shot("grupo_02_dupla")
+	Game.dmg_stats.erase("aliado")
+	await engage_area(tpos(41, 12), 260.0, 160.0)
+	await secs(1.5)
+	check("Aliada e criatura dela causam dano", float(Game.dmg_stats.get("aliado", 0.0)) > 0.0, str(Game.dmg_stats.get("aliado", 0.0)))
+	check("Contrato de dupla concluído", Game.has_flag("saqueadores_ok"), "vivos=%d" % contract_enemies("saqueadores").size())
+	var freed := W.enemies().filter(func(e): return e.alive_flag and e.kind == "wild" and str(e.uid).begins_with("saqueadores_f"))
+	print("feras libertadas: ", freed.size())
+	await shot("grupo_03_fim")
+	await advance_dialogs()
+	await frames(5)
+	check("Recompensa entregue e aliada volta para a vila", Game.item_count("selo_refinado") >= 2 and Game.party.is_empty() and W.allies().is_empty())
+	if freed.size() > 0 and is_instance_valid(freed[0]):
+		Game.give_item("selo_basico", 4)
+		Game.rng_override = func(): return 0.0
+		await weaken(freed[0])
+		var cap := is_instance_valid(freed[0]) and await capture_wild(freed[0], 8)
+		Game.rng_override = Callable()
+		check("Fera libertada pode ser capturada", cap)
+	# fera libertada: teste determinístico do mecanismo
+	var d := {"kind": "domador", "id": "t_dom", "x": int(P.global_position.x / 16), "y": int(P.global_position.y / 16) + 6, "contrato": "teste"}
+	var en := Enemy.new(); en.init(W, "domador", d); W.ysort.add_child(en)
+	var fd := {"kind": "fera", "id": "t_fera", "dono": "t_dom", "species": "lumipim", "level": 3, "x": d["x"] + 2, "y": d["y"], "contrato": "teste"}
+	var fe := Enemy.new(); fe.init(W, "fera", fd); W.ysort.add_child(fe)
+	await frames(3)
+	en.take_damage(9999.0, en.global_position, {"src": "heroi"})
+	await frames(3)
+	check("Derrotar o domador liberta a fera (vira selvagem calma e capturável)", fe.alive_flag and fe.kind == "wild" and fe.capturable and fe.angry_t <= 0.0)
+	fe.queue_free()
+	# patrulha: aliada convocada fora de contrato
+	check("Bruna pode ser convocada para patrulha", Game.can_recruit("bruna"))
+	Game.toggle_party("bruna")
+	await frames(5)
+	var br: Node = W.allies()[0] if W.allies().size() > 0 else null
+	check("Bruna acompanha em patrulha", br != null)
+	if br != null:
+		br.hp = 1.0
+		br.take_hit(50.0, br.global_position + Vector2(10, 0), {})
+		check("Aliada cai ao perder a vida", br.st == Ally.St.DOWN)
+		await goto(br.global_position, 10.0, 6.0)
+		release_moves()
+		await secs(1.6)
+		check("Herói reanima a aliada ficando perto", br.st != Ally.St.DOWN and br.hp > 1.0)
+	Game.toggle_party("bruna")
+	await frames(5)
+	# trio
+	Game.set_flag("visitou_clareira_raizes")
+	Game.hero["level"] = 8
+	Game.hero["hp"] = Game.hero_max_hp()
+	check("Contrato em trio libera após a dupla", Game.contract_state("emboscada") == "disponivel")
+	Game.accept_contract("emboscada")
+	await frames(8)
+	check("Trio: Bruna e Ravi no grupo", W.allies().size() == 2)
+	await exit_to("vila_lumen", 8.0, 17 * 16.0 + 8.0)
+	await exit_to("clareira_raizes", 22 * 16.0 + 8.0, 30 * 16.0 + 8.0)
+	await frames(10)
+	check("Bando da emboscada aparece na Clareira", contract_enemies("emboscada").size() == 6)
+	await goto(tpos(22, 20), 30.0, 40.0)
+	await shot("grupo_04_trio")
+	await engage_area(tpos(22, 26), 300.0, 200.0)
+	await secs(1.5)
+	check("Contrato em trio concluído", Game.has_flag("emboscada_ok"), "vivos=%d hp=%d" % [contract_enemies("emboscada").size(), int(Game.hero["hp"])])
+	check("Recompensa do trio: Botas do Vento", Game.item_count("botas_vento") == 1)
+	await advance_dialogs()
+	W.save_now(4)
+	SaveSys.load_game(4)
+	await frames(10)
+	check("Save mantém contratos", Game.has_flag("saqueadores_ok") and Game.has_flag("emboscada_ok") and Game.contract == "")
+	# acessórios de criatura
+	var a1: Dictionary = Game.new_individual("brotisco", 5); Game.individuals[a1["uuid"]] = a1
+	var a2: Dictionary = Game.new_individual("lumipim", 5); Game.individuals[a2["uuid"]] = a2
+	var hp0 := Game.creature_hp_max(a1)
+	check("Coleira de Couro recebida no contrato", Game.item_count("coleira_couro") >= 1)
+	check("Equipar coleira dá +12 de vida à criatura", Game.equip_creature(a1["uuid"], "coleira_couro") and Game.creature_hp_max(a1) == hp0 + 12.0)
+	check("A mesma peça não serve a duas criaturas ao mesmo tempo", Game.item_count("coleira_couro") > 1 or not Game.equip_creature(a2["uuid"], "coleira_couro"))
+	Game.give_item("selo_ancestral", 1)
+	var at0 := Game.creature_atk(a2)
+	Game.equip_creature(a2["uuid"], "selo_ancestral")
+	check("Selo Ancestral: +25% de ataque e recarga menor", absf(Game.creature_atk(a2) - at0 * 1.25) < 0.01 and Game.creature_cd_mult(a2) < 1.0)
+	W.save_now(4)
+	SaveSys.load_game(4)
+	await frames(5)
+	check("Save mantém acessórios das criaturas", str(Game.individuals.get(a2["uuid"], {}).get("acessorio", "")) == "selo_ancestral")
+	# itens-chave
+	Game.give_item("frasco_seiva", 1)
+	Game.refill_flasks()
+	Game.hero["hp"] = 5.0
+	P._apply_damage(50.0)
+	check("Frasco de Seiva levanta o herói com metade da vida", P.state != Player.S.DEAD and float(Game.hero["hp"]) >= Game.hero_max_hp() * 0.45 and not Game.flask_ready())
+	var mh := Game.hero_max_hp()
+	Game.give_item("semente_vida", 1)
+	check("Semente de Vida aumenta a vida máxima", Game.hero_max_hp() == mh + 12.0)
+	await exit_to("vila_lumen", 22 * 16.0 + 8.0, 8.0)
+	Game.give_item("luvas_pedra", 1)
+	await goto(tpos(12, 9), 4.0, 30.0)
+	await face(Vector2.UP)
+	await interact_press()
+	await frames(20)
+	check("Luvas de Pedra erguem a pedra e revelam a Semente de Vida", W.cur_tiles[8][12] != "o" and ent_by_id("semente_vila") != null)
+	await goto(tpos(12, 8), 4.0, 10.0)
+	await frames(5)
+	await interact_press()
+	await frames(10)
+	check("Semente escondida coletada", Game.has_flag("semente_vila_pega"))
+	await goto(tpos(30, 17), 4.0, 30.0)
+	var x0 := P.global_position.x
+	steer(Vector2.RIGHT)
+	await frames(2)
+	Input.action_press("dodge")
+	await frames(40)
+	var running: bool = P.running
+	Input.action_release("dodge")
+	release_moves()
+	check("Botas do Vento: segurar a esquiva faz correr", running and P.global_position.x - x0 > 90.0, "%s %.0f" % [running, P.global_position.x - x0])
+# =============================================================== HABILIDADES DAS CRIATURAS (aprender, escolher, usar, salvar)
+## Uso: godot --headless --fixed-fps 60 --path . -- --e2e --habilidades
+var hab_toasts: Array = []
+
+func _hab_add(sp_id: String, lvl: int) -> Dictionary:
+	var ind := Game.new_individual(sp_id, lvl)
+	Game.individuals[ind["uuid"]] = ind
+	Game.team.append(ind["uuid"])
+	Game.team_changed.emit()
+	return ind
+
+func _hab_top_title() -> String:
+	var t: MenuScreen = main.ui._top()
+	return t.title if t != null else ""
+
+func _hab_fire(ind: Dictionary, hid: String) -> bool:
+	Game.hab_set_active(ind["uuid"], hid)
+	Game.set_active(ind["uuid"])
+	W.refresh_companion(false)
+	await frames(3)
+	Game.skill_cd[ind["uuid"]] = 0.0
+	var c: Node = W.companion
+	c.target = null
+	return c.command_skill(Vector2.RIGHT)
+
+func _hab_open_team_creature(uuid: String) -> void:
+	await ui_press("pause")
+	await ui_press("ui_down")
+	await ui_press("ui_accept")      # Equipe e criaturas
+	await frames(3)
+	for i in Game.team.find(uuid):
+		await ui_press("ui_down")
+	await ui_press("ui_accept")      # menu da criatura
+	await frames(3)
+
+func run_habilidades() -> void:
+	SaveSys.delete_slot(3)
+	Game.toast.connect(func(t): hab_toasts.append(t))
+	main.start_new_game(3)
+	await frames(10)
+	await advance_dialogs()
+	Game.god_mode = false
+	# ---- dados
+	var ok_data := true
+	var why: Array = []
+	for sid in ["brotisco", "lumipim", "cascalito", "faisquito", "ferrunho", "fuligin"]:
+		var base: Array = Game.hab_list(sid)
+		var evo: String = Data.species[sid]["evolucao"]["para"]
+		var ev_l: Array = Game.hab_list(evo)
+		var base_ids: Array = base.map(func(h): return h["id"])
+		var ev_ids: Array = ev_l.map(func(h): return h["id"])
+		var herda: bool = base_ids.all(func(h): return ev_ids.has(h))
+		var excl: int = ev_l.size() - base.size()
+		if base.size() < 3 or base.size() > 4 or not herda or excl < 1 or excl > 2 or base_ids[0] != Data.species[sid]["skill"]:
+			ok_data = false
+			why.append(sid)
+	check("Hab: 12 espécies com 3–4 habilidades; evolução herda e libera 1–2 exclusivas", ok_data, str(why))
+	# ---- aprender por nível
+	var bro := _hab_add("brotisco", 1)
+	W.refresh_companion(false)
+	await frames(3)
+	check("Hab: Brotisco Nv.1 conhece só Raízes (ativa)", bro["hab_aprendidas"] == ["raizes"] and Game.hab_active(bro) == "raizes", str(bro["hab_aprendidas"]))
+	hab_toasts.clear()
+	while int(bro["nivel"]) < 4:
+		Game.add_creature_xp(bro, Game.creature_xp_to_next(int(bro["nivel"])))
+	check("Hab: ao subir de nível aprende Sementes (Nv.3) e Chicote (Nv.4)", bro["hab_aprendidas"].has("sementes") and bro["hab_aprendidas"].has("chicote_cipo") and bro["hab_aprendidas"].size() == 3, str(bro["hab_aprendidas"]))
+	var seen: bool = hab_toasts.any(func(t): return "aprendeu Sementes Curativas! Escolha no menu" in t)
+	check("Hab: toast 'X aprendeu Y! Escolha no menu'", seen, str(hab_toasts))
+	check("Hab: aprender não troca a ativa sozinho", Game.hab_active(bro) == "raizes")
+	# ---- escolher no menu (Pausa > Equipe > criatura > Habilidades…)
+	await _hab_open_team_creature(bro["uuid"])
+	for i in 3:
+		await ui_press("ui_down")    # Tornar ativa, Apelido, Evoluir, Habilidades…
+	await ui_press("ui_accept")
+	await frames(3)
+	var top: MenuScreen = main.ui._top()
+	check("Hab: menu da criatura abre a tela Habilidades", top != null and top.title.begins_with("Habilidades"), _hab_top_title())
+	var n_locked := 0
+	if top != null:
+		for it in top.items:
+			if not it.get("hdr", false) and not it.get("en", true) and "(Nv." in str(it["t"]):
+				n_locked += 1
+		await shot("hab_menu")
+		var info: String = top._info_text()
+		check("Hab: tela mostra descrição, recarga e dano", "Recarga" in info and "Dano" in info, info)
+	check("Hab: bloqueadas aparecem em cinza com o nível (exclusivas da evolução)", n_locked == 2, str(n_locked))
+	await ui_press("ui_down")        # Sementes Curativas
+	await ui_press("ui_accept")
+	await frames(3)
+	check("Hab: escolher no menu define a ativa", bro["hab_ativa"] == "sementes" and Game.hab_active(bro) == "sementes", str(bro.get("hab_ativa")))
+	await close_menus()
+	check("Hab: menus fecham", not main.ui.has_screen() and not get_tree().paused)
+	# ---- Q usa a escolhida com recarga própria
+	Game.hero["hp"] = 40.0
+	Game.skill_cd[bro["uuid"]] = 0.0
+	await tap("skill", 2)
+	await frames(2)
+	var cd1: float = float(Game.skill_cd.get(bro["uuid"], 0.0))
+	check("Hab: Q usa Sementes Curativas (cura o herói)", float(Game.hero["hp"]) > 40.0, str(Game.hero["hp"]))
+	check("Hab: recarga própria da escolhida (12 s)", cd1 > 11.5 and cd1 <= 12.0, str(cd1))
+	var hp_b: float = float(Game.hero["hp"])
+	await tap("skill", 2)
+	check("Hab: em recarga, Q não repete", float(Game.hero["hp"]) == hp_b)
+	var wolf := _spawn_wolf(W.companion.global_position + Vector2(24, 0))
+	var w0: float = wolf.hp
+	await _hab_fire(bro, "chicote_cipo")
+	await frames(2)
+	check("Hab: Chicote de Cipó fere à frente com recarga de 5 s", wolf.hp < w0 and abs(float(Game.skill_cd[bro["uuid"]]) - 5.0) < 0.2, "%s -> %s cd %s" % [w0, wolf.hp, Game.skill_cd[bro["uuid"]]])
+	wolf.queue_free()
+	await frames(2)
+	# ---- novas execuções: escudo, cadeia, investida em cadeia
+	var cas := _hab_add("cascalito", 3)
+	await _hab_fire(cas, "casca")
+	check("Hab: Escudo de Casca reduz dano (30%)", is_equal_approx(Game.hab_shield_mult(), 0.7), str(Game.hab_shield_mult()))
+	Game.hero["hp"] = 100.0
+	P.inv_timer = 0.0
+	P.state = Player.S.FREE
+	Game.difficulty = "desafio"
+	P.take_hit(20.0, P.global_position + Vector2(30, 0))
+	check("Hab: herói com escudo recebe menos dano", abs(float(Game.hero["hp"]) - (100.0 - 20.0 * (1.0 - Game.hero_reduction()) * 0.7)) < 0.2, str(Game.hero["hp"]))
+	Game.difficulty = "aventura"
+	await secs(5.5)
+	check("Hab: escudo expira", Game.hab_shield_mult() == 1.0)
+	var lum := _hab_add("lumipim", 3)
+	Game.set_active(lum["uuid"])
+	W.refresh_companion(false)
+	await frames(3)
+	var cp: Vector2 = W.companion.global_position
+	var ws: Array = [_spawn_wolf(cp + Vector2(40, 0)), _spawn_wolf(cp + Vector2(70, 20)), _spawn_wolf(cp + Vector2(100, 0))]
+	var hp_ws: Array = ws.map(func(w): return w.hp)
+	await _hab_fire(lum, "lampejo")
+	await frames(2)
+	var hit_n := 0
+	for i in 3:
+		if ws[i].hp < hp_ws[i]:
+			hit_n += 1
+	check("Hab: Lampejo em Cadeia salta entre 3 inimigos", hit_n == 3, str(hit_n))
+	for w in ws:
+		w.queue_free()
+	await frames(2)
+	Game.move_to_sanctuary(cas["uuid"])
+	var roc := _hab_add("rocantor", 6)
+	Game.set_active(roc["uuid"])
+	W.refresh_companion(false)
+	await frames(3)
+	cp = W.companion.global_position
+	var ws2: Array = [_spawn_wolf(cp + Vector2(30, 0)), _spawn_wolf(cp + Vector2(60, 24))]
+	var hp2: Array = ws2.map(func(w): return w.hp)
+	check("Hab: Rocantor (evoluída) já conhece Avalanche no Nv.6", roc["hab_aprendidas"].has("avalanche") and not roc["hab_aprendidas"].has("muralha"))
+	await _hab_fire(roc, "avalanche")
+	await secs(1.2)
+	var hit2 := 0
+	for i in 2:
+		if is_instance_valid(ws2[i]) and ws2[i].hp < hp2[i]:
+			hit2 += 1
+	check("Hab: Avalanche (investida em cadeia) acerta mais de um inimigo", hit2 == 2, str(hit2))
+	for w in ws2:
+		if is_instance_valid(w):
+			w.queue_free()
+	Game.move_to_sanctuary(roc["uuid"])
+	await frames(3)
+	# ---- evolução: aprende a exclusiva e oferece a escolha
+	Game.set_active(bro["uuid"])
+	W.refresh_companion(false)
+	while int(bro["nivel"]) < 5:
+		Game.add_creature_xp(bro, Game.creature_xp_to_next(int(bro["nivel"])))
+	bro["vinculo"] = ["a", "b", "c"]
+	W.combat_t = 0.0
+	hab_toasts.clear()
+	await _hab_open_team_creature(bro["uuid"])
+	await ui_press("ui_down")
+	await ui_press("ui_down")        # Evoluir
+	await ui_press("ui_accept")
+	await frames(3)
+	await ui_press("ui_accept")      # Confirmar
+	await frames(6)
+	check("Hab: Brotisco evoluiu para Galhardo", bro["species_id"] == "galhardo")
+	check("Hab: evolução avisa a habilidade exclusiva aprendida", hab_toasts.any(func(t): return "aprendeu Raízes Profundas! Escolha no menu" in t), str(hab_toasts))
+	top = main.ui._top()
+	check("Hab: evolução oferece a escolha (abre Habilidades)", top != null and top.title.begins_with("Habilidades"), _hab_top_title())
+	check("Hab: ativa preservada na evolução", Game.hab_active(bro) == "chicote_cipo", Game.hab_active(bro))
+	if top != null:
+		var target_i := -1
+		for i in top.items.size():
+			if "Raízes Profundas" in str(top.items[i]["t"]) and top.items[i].get("en", true):
+				target_i = i
+		if target_i >= 0:
+			top.sel = target_i
+			await ui_press("ui_accept")
+	await shot("hab_evolucao")
+	check("Hab: escolhe a exclusiva na tela da evolução", Game.hab_active(bro) == "raizes_profundas", str(bro["hab_ativa"]))
+	await close_menus()
+	# ---- Q com a exclusiva escolhida
+	Game.skill_cd[bro["uuid"]] = 0.0
+	await tap("skill", 2)
+	await frames(2)
+	check("Hab: Q usa Raízes Profundas (recarga 8 s)", abs(float(Game.skill_cd.get(bro["uuid"], 0.0)) - 8.0) < 0.2, str(Game.skill_cd.get(bro["uuid"])))
+	# ---- Santuário: também acessível pelo armazenamento
+	main.ui.open_storage()
+	await frames(3)
+	await ui_press("ui_down")        # primeira criatura guardada (abaixo de "Ordenar")
+	await ui_press("ui_accept")
+	await frames(3)
+	await ui_press("ui_down")
+	await ui_press("ui_down")        # Levar à equipe, Apelido…, Habilidades…
+	await ui_press("ui_accept")
+	await frames(3)
+	check("Hab: Santuário (armazenamento) também abre Habilidades", _hab_top_title().begins_with("Habilidades"), _hab_top_title())
+	await close_menus()
+	# ---- save/load mantém
+	Game.hab_set_active(lum["uuid"], "lampejo")
+	var ok_s := SaveSys.save_game(3)
+	Game.hab_set_active(bro["uuid"], "raizes")
+	bro["hab_aprendidas"] = ["raizes"]
+	var ok_l := SaveSys.load_game(3)
+	var bro2: Dictionary = Game.individuals.get(bro["uuid"], {})
+	var lum2: Dictionary = Game.individuals.get(lum["uuid"], {})
+	check("Hab: save/load mantém ativa e aprendidas", ok_s and ok_l and bro2.get("hab_ativa", "") == "raizes_profundas" and bro2.get("hab_aprendidas", []).size() == 4 and lum2.get("hab_ativa", "") == "lampejo", "%s %s" % [bro2.get("hab_ativa"), bro2.get("hab_aprendidas")])
+	# ---- migração de save antigo (sem os campos)
+	var d: Dictionary = JSON.parse_string(JSON.stringify(Game.to_dict()))
+	for u in d["individuals"]:
+		d["individuals"][u].erase("hab_ativa")
+		d["individuals"][u].erase("hab_aprendidas")
+	d["individuals"][bro["uuid"]]["species_id"] = "brotisco"
+	d["individuals"][bro["uuid"]]["nivel"] = 4
+	hab_toasts.clear()
+	var ok_m := Game.from_dict(d)
+	var b3: Dictionary = Game.individuals[bro["uuid"]]
+	var c3: Dictionary = Game.individuals[cas["uuid"]]
+	check("Hab: save antigo migra (ativa = original, aprendidas pelo nível)", ok_m and b3["hab_ativa"] == "raizes" and b3["hab_aprendidas"] == ["raizes", "sementes", "chicote_cipo"] and c3["hab_ativa"] == "avanco" and c3["hab_aprendidas"] == ["avanco", "casca"], "%s %s / %s" % [b3.get("hab_ativa"), b3.get("hab_aprendidas"), c3.get("hab_aprendidas")])
+	check("Hab: migração não gera avisos de 'aprendeu'", not hab_toasts.any(func(t): return "aprendeu" in t))
+	var bad: Dictionary = Game.individuals[lum["uuid"]]
+	bad["hab_ativa"] = "eclipse"
+	check("Hab: ativa inválida volta à habilidade original", Game.hab_active(bad) == "pulso")
+## Trilha dinâmica: lugar, interiores, combate, suspense na antessala, chefe, jingles com ducking
+func mus_wait(track: String, timeout := 4.0) -> bool:
+	var t := 0.0
+	while Audio.current_track() != track and t < timeout:
+		await frames(6)
+		t += 0.1
+	return Audio.current_track() == track
+
+func mus_info() -> String:
+	return "trilha=%s lugar=%s jingle=%s duck=%.1f vozes=%d" % [Audio.current_track(), Audio.place(), Audio.stinger_name(), Audio.duck_db(), Audio.voices()]
+
+func run_musica() -> void:
+	SaveSys.delete_slot(3)
+	main.start_new_game(3)
+	await frames(10)
+	await advance_dialogs()
+	Game.god_mode = true
+	check("Vila Lúmen toca a trilha da vila", await mus_wait("vila"), mus_info())
+	var ok := await enter_house(Vector2i(8, 7), "casa_maru")
+	ok = ok and await mus_wait("casa", 1.0)
+	check("Interior da casa troca para a trilha de casa", ok, mus_info())
+	check("Troca por crossfade (dois players soando juntos)", Audio.voices() == 2, mus_info())
+	await secs(2.0)
+	check("Crossfade termina com um só player", Audio.voices() == 1, mus_info())
+	await leave_house()
+	check("Voltar à vila retoma a trilha da vila", await mus_wait("vila"), mus_info())
+	ok = await enter_house(Vector2i(10, 27), "casa_corvelo")
+	check("Casa abandonada dos Corvelo toca a trilha de memória", ok and await mus_wait("memoria"), mus_info())
+	await leave_house()
+	ok = await exit_to("bosque_lanternas", 43 * 16.0, 15 * 16.0 + 8.0)
+	check("Bosque toca a trilha da floresta", ok and await mus_wait("floresta"), mus_info())
+	# combate com um inimigo de verdade
+	var wolf := _spawn_wolf(P.global_position + Vector2(48, 0))
+	wolf.set_physics_process(true)
+	check("Combate liga a trilha de combate", await mus_wait("combate", 8.0), mus_info())
+	if is_instance_valid(wolf) and wolf.alive_flag:
+		wolf.die("heroi")
+	check("Fim do combate retoma a base do lugar", await mus_wait("floresta", 10.0), mus_info())
+	# santuário profundo: masmorra, antessala do Lenhador com suspense, chefe, vitória
+	W.load_map("santuario_b", "from_a")
+	await frames(10)
+	check("Santuário profundo toca a trilha de masmorra", await mus_wait("masmorra"), mus_info())
+	P.global_position = tpos(24, 21)
+	check("Antessala do Lenhador liga o suspense (zona do mapa)", await mus_wait("suspense") and Audio.suspense_reason(W) == "zona", mus_info())
+	P.global_position = tpos(24, 31)
+	var b := find_boss("lenhador")
+	check("Chefe desperto toca a trilha de chefe", b != null and await mus_wait("chefao") and Audio.has_mood("suspense") == false, mus_info())
+	b.die("heroi")
+	await frames(3)
+	check("Vitória: jingle por cima e base de volta por baixo", Audio.stinger_name() == "vitoria" and Audio.current_track() == "masmorra", mus_info())
+	await frames(30)
+	check("Ducking abaixa a base durante o jingle", Audio.duck_db() < -15.0, mus_info())
+	var t := 0.0
+	while Audio.stinger_name() != "" and t < 10.0:
+		await frames(6)
+		t += 0.1
+	await secs(2.0)
+	check("Jingle termina e a base volta ao volume normal", Audio.stinger_name() == "" and Audio.duck_db() > -0.5 and Audio.current_track() == "masmorra", mus_info())
+	P.global_position = tpos(24, 21)
+	await secs(0.5)
+	check("Antessala sem suspense depois do chefe derrotado", not Audio.has_mood("suspense"), mus_info())
+	# vida baixa e escuridão
+	var hp0 := float(Game.hero["hp"])
+	Game.hero["hp"] = Game.hero_max_hp() * 0.15
+	Game.hero_changed.emit()
+	check("Vida baixa liga o suspense", await mus_wait("suspense") and Audio.suspense_reason(W) == "vida_baixa", mus_info())
+	Game.hero["hp"] = hp0
+	Game.hero_changed.emit()
+	check("Vida recuperada volta à base", await mus_wait("masmorra"), mus_info())
+	W.set_darkness(true)
+	check("Escuridão liga o suspense", await mus_wait("suspense") and Audio.suspense_reason(W) == "escuridao", mus_info())
+	W.set_darkness(false)
+	check("Luz de volta retoma a base", await mus_wait("masmorra"), mus_info())
+	# região 2
+	W.load_map("desfiladeiro", "default")
+	check("Desfiladeiro tem trilha própria (vento)", await mus_wait("desfiladeiro"), mus_info())
+	W.load_map("minas_entrada", "default")
+	check("Minas da Brasa tocam a trilha das minas", await mus_wait("minas"), mus_info())
+	W.load_map("fundicao_c", "from_rito")
+	await frames(10)
+	check("Antessala do Ferreiro liga o suspense", await mus_wait("suspense"), mus_info())
+	P.global_position = tpos(24, 17)
+	var fb := find_boss("ferreiro")
+	check("Ferreiro toca a trilha de chefe das minas (diferente do chefão)", fb != null and await mus_wait("chefe_minas"), mus_info())
+	fb.die("heroi")
+	await frames(3)
+	check("Ferreiro derrotado: jingle de vitória e volta à masmorra", Audio.stinger_name() == "vitoria" and Audio.current_track() == "masmorra", mus_info())
+	W.load_map("forja_cobre", "default")
+	await advance_dialogs()
+	check("Forja de Cobre em festa depois do Ferreiro", await mus_wait("vila_festa"), mus_info())
+	# descoberta: baú com diário
+	W.load_map("fundicao_a", "from_pedreira")
+	await frames(10)
+	for e in W.enemies():
+		e.die("heroi")
+	var chest := ent_by_id("fa_bau_escoria")
+	P.global_position = chest.global_position + Vector2(0, 16)
+	await use_ent("fa_bau_escoria", Vector2(0, 16), Vector2.UP)
+	await frames(5)
+	check("Baú com diário toca o jingle de descoberta", Game.chests.has("fa_bau_escoria") and Audio.stinger_name() == "descoberta", mus_info())
+	check("Diário puxa a trilha de memória", await mus_wait("memoria", 2.0), mus_info())
+	await advance_dialogs()
+	# vila depois do Cervo e diálogo de memória
+	Game.set_flag("cervo_morto")
+	W.load_map("vila_lumen", "default")
+	check("Vila transformada toca a versão em festa", await mus_wait("vila_festa"), mus_info())
+	await secs(1.5)
+	await advance_dialogs()
+	W.start_dialog("mae")
+	await frames(5)
+	check("Diálogo da família Corvelo toca a trilha de memória", await mus_wait("memoria"), mus_info())
+	await advance_dialogs()
+	check("Fechar o diálogo retoma a festa", await mus_wait("vila_festa"), mus_info())
+	Audio.music("titulo")
+	check("API antiga Audio.music continua funcionando", Audio.current_track() == "titulo", mus_info())

@@ -48,8 +48,12 @@ func _ready() -> void:
 		"npc":
 			solid = true
 			anim = AnimatedSprite2D.new()
-			anim.sprite_frames = Art.npc_frames(def.get("sprite", "npc_elder"))
-			anim.offset = Vector2(0, -6)
+			if def.get("human", false):
+				anim.sprite_frames = Art.human_frames(def["sprite"])
+				anim.offset = Vector2(0, -14)
+			else:
+				anim.sprite_frames = Art.npc_frames(def.get("sprite", "npc_elder"))
+				anim.offset = Vector2(0, -6)
 			add_child(anim)
 			anim.play("idle_down")
 			_shadow()
@@ -133,7 +137,7 @@ func _ready() -> void:
 			reach = 22.0
 		"pickup":
 			sprite = Sprite2D.new()
-			sprite.texture = Art.region("itens_missao", int(def.get("frame", 0)) * 16, 0, 16, 16)
+			sprite.texture = Art.region(def.get("sheet", "itens_missao"), int(def.get("frame", 0)) * 16, 0, 16, 16)
 			sprite.offset = Vector2(0, -2)
 			add_child(sprite)
 			solid = false
@@ -239,7 +243,7 @@ func prompt() -> String:
 		"crack": return "" if Game.has_flag(def.get("flag", "")) else "Rocha fissurada"
 		"ore": return "" if opened else "Minerar"
 		"anvil": return "Forja"
-		"prop": return "Examinar" if def.has("dialog") else ("Forja" if def.get("forge", false) else "")
+		"prop": return "Contratos" if def.get("contratos", false) else ("Examinar" if def.has("dialog") else ("Forja" if def.get("forge", false) else ""))
 		"pickup": return "Pegar"
 		"spirit_mark": return "Examinar"
 		"rite_reset": return "Reiniciar rito"
@@ -270,7 +274,9 @@ func interact(player: Node) -> void:
 		"ore": _mine()
 		"anvil": world.ui.open_forge()
 		"prop":
-			if def.get("forge", false):
+			if def.get("contratos", false):
+				world.ui.open_contracts()
+			elif def.get("forge", false):
 				world.ui.open_forge()
 			elif def.has("dialog"):
 				world.start_dialog(def["dialog"], self)
@@ -286,6 +292,7 @@ func _open_chest() -> void:
 	Game.chests[eid] = true
 	set_frame(true)
 	Audio.play("pickup")
+	Audio.on_treasure(def.get("loot", {}))
 	Game.give_loot(def.get("loot", {}))
 	if def.has("set_flag"):
 		Game.set_flag(def["set_flag"])
@@ -379,12 +386,14 @@ func _draft() -> void:
 		world.steam_at(global_position + Vector2(0, -6), 1.2)
 		Game.set_flag(flag)
 		world.say(def.get("msg", "Você força a placa solta de onde o vapor vazava. Uma passagem!"))
+		Audio.on_treasure({}, true)
 		steam.visible = false
 		return
 	if world.creature_action(self, "fumaca", "%s soprou fumaça: a corrente de ar revela uma fresta na rocha!",
 			"Um ar frio escapa da rocha... algo que faça fumaça mostraria por onde. (Fuligin)"):
 		world.smoke_cloud(global_position + Vector2(0, 10), 20.0, 2.0)
 		Audio.play("dodge")
+		Audio.on_treasure({}, true)
 		Game.set_flag(flag)
 		steam.visible = false
 
@@ -403,6 +412,7 @@ func break_rock() -> void:
 		return
 	Game.set_flag(flag)
 	Audio.play("thud")
+	Audio.on_treasure({}, true)
 	world.fx_at("shards", global_position + Vector2(0, -4), 0.5, 0.0, 1.4)
 	world.say("A Ruptura Ígnea partiu a rocha fissurada!")
 	if sprite:
