@@ -2,4 +2,3 @@
 *.import
 /build/
 tests/last_result.txt
-.claude/
