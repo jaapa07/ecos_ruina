@@ -1189,7 +1189,7 @@ func _checkpoint_location() -> Dictionary:
 func _update_camera(delta: float) -> void:
 	shake_t = max(0.0, shake_t - delta)
 	if shake_t > 0.0 and not Game.prefs.get("reduz_tremor", false):
-		camera.offset = Vector2(randf_range(-1, 1), randf_range(-1, 1)).round() * shake_amp
+		camera.offset = Vector2(Game.fx_rng.randf_range(-1, 1), Game.fx_rng.randf_range(-1, 1)).round() * shake_amp
 	else:
 		camera.offset = Vector2.ZERO
 	# mapas menores que a tela ficam centralizados
@@ -1681,6 +1681,12 @@ func on_player_died() -> void:
 	Game.stats["mortes"] = int(Game.stats["mortes"]) + 1
 	frozen = true
 	await get_tree().create_timer(1.3).timeout
+	# morte junto com uma fala/menu aberto (ex.: golpe final simultâneo com a queda do chefe): o retorno ao
+	# santuário espera a fala fechar, para o callback dela não rodar já no mapa do santuário
+	var guard := 0
+	while ui and ui.is_modal() and guard < 36000:
+		await get_tree().process_frame
+		guard += 1
 	await ui.fade(1.0, 0.5)
 	var lost := int(floor(Game.fragments * 0.10))
 	Game.last_death = {"antes": Game.fragments, "perdidos": lost, "mapa": map_id}
@@ -1706,7 +1712,7 @@ func _vila_return_scene() -> void:
 	await get_tree().create_timer(0.8).timeout
 	player.set_busy(true)
 	ui.dialog(["As raízes recuaram da vila e as flores abriram por toda parte. Pela primeira vez em três luas, ninguém ouviu vozes à noite.", "A família Corvelo voltou para casa. Pipo corre para mostrar a todos o que você fez — e a passagem ao norte, para o Desfiladeiro do Eco, está aberta.",
-		"Só a Raiz Viva pode construir uma ponte sobre a ravina: vá até lá e aperte E no suporte marcado."], func():
+		"Só a Raiz Viva pode construir uma ponte sobre a ravina: vá até lá e aperte {interagir} no suporte marcado."], func():
 		player.set_busy(false)
 		autosave())
 
@@ -1848,7 +1854,7 @@ func valve_use(v: Ent) -> void:
 		var area: Array = c.get("area", [])
 		if area.size() == 4 and (c.get("if", "") == flag or c.get("unless", "") == flag):
 			for k in 4:
-				steam_at(Vector2((float(area[0]) + randf() * float(area[2])) * TILE, (float(area[1]) + randf() * float(area[3])) * TILE), 1.0)
+				steam_at(Vector2((float(area[0]) + Game.fx_rng.randf() * float(area[2])) * TILE, (float(area[1]) + Game.fx_rng.randf() * float(area[3])) * TILE), 1.0)
 	say("Vapor frio sibila pelas grades." if Game.has_flag(flag) else "A válvula fecha: o piso volta a esquentar.")
 	if companion != null and is_instance_valid(companion):
 		pass
@@ -2076,7 +2082,7 @@ func sluice_use(c: Ent) -> void:
 		var area: Array = cd.get("area", [])
 		if area.size() == 4 and (cd.get("if", "") == flag or cd.get("unless", "") == flag):
 			for k in 5:
-				fx_at("splash", Vector2((float(area[0]) + randf() * float(area[2])) * TILE, (float(area[1]) + randf() * float(area[3])) * TILE), 0.5)
+				fx_at("splash", Vector2((float(area[0]) + Game.fx_rng.randf() * float(area[2])) * TILE, (float(area[1]) + Game.fx_rng.randf() * float(area[3])) * TILE), 0.5)
 	_relocate_from_solid()
 	say(c.def.get("msg_on", "A comporta range: a água muda de lugar.") if Game.has_flag(flag) else c.def.get("msg_off", "A comporta volta: a água retorna ao leito de antes."))
 

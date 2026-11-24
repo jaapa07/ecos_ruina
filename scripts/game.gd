@@ -55,6 +55,9 @@ var skill_cd := {}          # uuid -> segundos restantes
 var save_block := 0         # > 0 impede salvar (captura, transição)
 var in_game := false
 var rng := RandomNumberGenerator.new()
+## Sorteios só de aparência (tom dos sons, tremor de câmera, partículas): fora do RNG global, para que o
+## som (cujo fim depende do relógio real) e os efeitos nunca mudem os sorteios de jogo.
+var fx_rng := RandomNumberGenerator.new()
 var rng_override: Callable = Callable()   # testes: func() -> float
 var god_mode := false
 var last_death := {}
@@ -89,6 +92,7 @@ const ACTION_NAMES := {
 
 func _ready() -> void:
 	rng.randomize()
+	fx_rng.randomize()
 	# testes usam um arquivo próprio e começam dos padrões: as opções do jogador não mudam o fluxo
 	var a := OS.get_cmdline_user_args()
 	if "--e2e" in a or "--unit" in a:
@@ -518,6 +522,10 @@ func respec(cost: int = 50) -> bool:
 	hero_changed.emit(); inventory_changed.emit()
 	return true
 
+## Relógio de jogo em milissegundos, contado em quadros de física (determinístico; não depende do relógio real).
+func clock_ms() -> int:
+	return int(Engine.get_physics_frames() * 1000 / maxi(1, Engine.physics_ticks_per_second))
+
 # =============================================================== CRIATURAS
 func new_uuid() -> String:
 	return "%d-%08x%04x" % [Time.get_unix_time_from_system(), randi(), individuals.size()]
@@ -750,7 +758,7 @@ func check_evolution_hint(ind: Dictionary) -> void:
 	var key := "evo_aviso_%s_%s" % [ind["uuid"], ind["species_id"]]
 	if evolution_status(ind)["possivel"] and not has_flag(key):
 		set_flag(key)
-		toast.emit("%s pode evoluir! Abra a Equipe (I) fora de combate." % creature_name(ind))
+		toast.emit("%s pode evoluir! Abra a Equipe ({menu}) fora de combate." % creature_name(ind))
 
 func bond_count(ind: Dictionary) -> int:
 	return ind.get("vinculo", []).size()
@@ -1415,12 +1423,39 @@ const KEYS_PC := {"andar": "WASD", "atacar": "J", "defender": "K", "esquivar": "
 const KEYS_TOUCH := {"andar": "o polegar esquerdo", "atacar": "a Espada", "defender": "o Escudo", "esquivar": "as Setas", "interagir": "o botão E",
 	"capturar": "o Selo", "habilidade": "a Estrela", "trocar": "Troca (no alto)", "comportamento": "o menu da Equipe", "tonico": "o Tônico (no alto)", "menu": "o Menu (no alto)", "cancelar": "o Escudo"}
 
+const MARKER_ACTIONS := {"atacar": "attack", "defender": "guard", "esquivar": "dodge", "interagir": "interact", "capturar": "capture",
+	"habilidade": "skill", "trocar": "swap", "comportamento": "behavior", "tonico": "consumable", "menu": "inventory", "cancelar": "guard"}
+const KEY_NAMES := {"Space": "Espaço", "Escape": "Esc", "Up": "↑", "Down": "↓", "Left": "←", "Right": "→", "Enter": "Enter", "Shift": "Shift"}
+
+func _moves_remapped() -> bool:
+	var kp: Dictionary = prefs.get("keys", {})
+	return kp.has("move_up") or kp.has("move_left") or kp.has("move_down") or kp.has("move_right")
+
+## Nome da tecla atual de uma ação (respeita o remapeamento feito nas Opções).
+func key_label(action: String) -> String:
+	var keys: Array = prefs.get("keys", {}).get(action, DEFAULT_KEYS.get(action, []))
+	if keys.is_empty():
+		return "?"
+	var nm := OS.get_keycode_string(int(keys[0]))
+	return str(KEY_NAMES.get(nm, nm))
+
 func k(text: String) -> String:
 	if text.find("{") < 0:
 		return text
-	var m: Dictionary = KEYS_TOUCH if TouchControls.active else KEYS_PC
-	for key in m:
-		text = text.replace("{" + key + "}", m[key])
+	if TouchControls.active:
+		for key in KEYS_TOUCH:
+			text = text.replace("{" + key + "}", KEYS_TOUCH[key])
+		return text
+	for key in KEYS_PC:
+		var tag: String = "{" + key + "}"
+		if text.find(tag) < 0:
+			continue
+		var lab: String = KEYS_PC[key]
+		if MARKER_ACTIONS.has(key):
+			lab = key_label(MARKER_ACTIONS[key])
+		elif key == "andar" and _moves_remapped():
+			lab = key_label("move_up") + key_label("move_left") + key_label("move_down") + key_label("move_right")
+		text = text.replace(tag, lab)
 	return text
 
 

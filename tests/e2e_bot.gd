@@ -15,6 +15,7 @@ var frame_count := 0
 var seen_errors := 0
 var exhausted_events := 0
 var all_toasts: Array = []
+var trace := OS.get_environment("QA_TRACE") != ""
 var shot_dir := "/tmp/shots"     # histórico de avisos do jogo (a fila visível do HUD guarda só 4)
 
 func _ready() -> void:
@@ -26,6 +27,9 @@ func _ready() -> void:
 	W = main.world
 	P = W.player
 	W.test_mode = true
+	# começa sempre do zero: saves de execuções anteriores mudariam o título (Continuar) e o fluxo
+	for i in 10:
+		SaveSys.delete_slot(i)
 	# aleatoriedade com semente fixa: o mesmo fluxo a cada execução (sorteios de captura, flanqueio, passeio)
 	var sd := 20261123
 	for a in args:
@@ -33,6 +37,7 @@ func _ready() -> void:
 			sd = int(a.substr(7))
 	seed(sd)
 	Game.rng.seed = sd
+	Game.fx_rng.seed = sd + 1
 	Game.toast.connect(func(t): if "exausta" in t: exhausted_events += 1)
 	Game.toast.connect(func(t): all_toasts.append(t))
 	main.ui.instant = true
@@ -64,6 +69,8 @@ func _ready() -> void:
 		await run_powers()
 	elif "--interface" in args:
 		await run_interface()
+	elif "--qa" in args:
+		await run_qa()
 	elif "--demo" in args:
 		await run_demo()
 	elif "--anim" in args:
@@ -87,6 +94,14 @@ func finish() -> void:
 	var f := FileAccess.open("res://tests/last_result.txt", FileAccess.WRITE)
 	if f:
 		f.store_string("\n".join(results) + "\nTOTAL: %d verificações, %d aprovadas, %d falhas\n" % [results.size(), passed, fails])
+	# encerramento limpo: sem sons tocando nem temporizadores pendentes (evita avisos de vazamento do motor na saída)
+	get_tree().paused = false
+	for n in get_tree().root.find_children("*", "AudioStreamPlayer", true, false) + get_tree().root.find_children("*", "AudioStreamPlayer2D", true, false):
+		n.stop()
+		n.stream = null
+	await get_tree().create_timer(2.5).timeout
+	OS.delay_msec(300)       # dá tempo à thread de mixagem de soltar as reproduções paradas
+	await frames(3)
 	get_tree().quit(1 if fails > 0 else 0)
 
 func check(name: String, cond: bool, detail := "") -> void:
@@ -96,6 +111,9 @@ func check(name: String, cond: bool, detail := "") -> void:
 		fails += 1
 		results.append("[FAIL] %s  %s" % [name, detail])
 	print(results[-1])
+	if trace:
+		# rastro para comparar execuções: a primeira linha diferente entre duas rodadas mostra onde o fluxo divergiu
+		print("  [trace] f=%d rng=%d pos=%s hp=%d map=%s" % [frame_count, Game.rng.state, str(P.global_position.round()) if P else "-", int(Game.hero.get("hp", 0)), W.map_id if W else "-"])
 
 func shot(name: String) -> void:
 	if DisplayServer.get_name() == "headless":
@@ -114,6 +132,17 @@ func frames(n: int) -> void:
 	for i in n:
 		await get_tree().physics_frame
 		frame_count += 1
+		if trace_frames:
+			_trace_frame()
+
+var trace_frames := OS.get_environment("QA_TRACE") == "2"
+func _trace_frame() -> void:
+	var parts: Array = ["f=%d ef=%d" % [frame_count, Engine.get_physics_frames()], str(P.global_position), str(P.velocity)]
+	for e in W.enemies():
+		parts.append("%s%s%.1f" % [e.name, str(e.global_position.round()), float(e.hp)])
+	if W.companion and is_instance_valid(W.companion):
+		parts.append("c" + str(W.companion.global_position.round()))
+	print("  [tf] ", " ".join(parts))
 
 func secs(s: float) -> void:
 	await frames(int(s * 60.0))
@@ -223,7 +252,8 @@ func goto(target: Vector2, tol := 4.0, timeout := 40.0, extra_block := {}) -> bo
 			replan = 1.5
 			if path.is_empty():
 				release_moves()
-				push_warning("sem caminho de %s para %s" % [str(here), str(target)])
+				# alvo inalcançável é esperado em lutas (ponto sobre água ou parede): registro informativo, não aviso do motor
+				print("  [info] sem caminho de %s para %s" % [str(here), str(target)])
 				return false
 		var goal: Vector2
 		if pi < path.size():
@@ -1447,7 +1477,7 @@ func run_unit() -> void:
 	# ---- movimento: diagonal não é mais rápida
 	P.global_position = Vector2(21 * 16 + 8, 16 * 16 + 8)
 	await frames(3)
-	var p0 := P.global_position
+	var p0: Vector2 = P.global_position
 	Input.action_press("move_right"); await frames(30); Input.action_release("move_right")
 	var d_axis := P.global_position.distance_to(p0)
 	P.global_position = Vector2(21 * 16 + 8, 16 * 16 + 8)
@@ -6813,3 +6843,319 @@ func run_interface() -> void:
 	await frames(5)
 	await shot("ui_44_toque_botoes_grandes")
 	Game.reset_prefs()
+
+
+# ================================================================ QA (auditoria de interface, textos e mapas)
+## Uso: -- --e2e --qa [--so-menus|--so-mapas]  (com xvfb + opengl3 para as fotos em $SHOTS_DIR ou /tmp/shots/qa_*.png).
+## Lista achados "QA:" no log; reprova só nos itens objetivos (marcador sem troca, spawn em parede, saída sem destino).
+var qa_n := 0
+var qa_hard := 0
+
+func qa_note(where: String, what: String, hard := false) -> void:
+	qa_n += 1
+	if hard:
+		qa_hard += 1
+	print("QA%s: %s | %s" % ["!" if hard else "", where, what])
+
+func _qa_raw_marker(t: String) -> bool:
+	var re := RegEx.new()
+	re.compile("\\{[a-z_]+\\}")
+	return re.search(t) != null
+
+func qa_audit_menu(tag: String) -> void:
+	var s: MenuScreen = main.ui._top()
+	if s == null:
+		qa_note(tag, "menu não abriu", true)
+		return
+	await frames(2)
+	await shot("qa_" + tag + ("_toque" if TouchControls.active else ""))
+	var font := Fonts.pixel()
+	if font.get_string_size(s.title, HORIZONTAL_ALIGNMENT_LEFT, -1, s._title_lab.get_theme_font_size("font_size")).x > s._title_lab.size.x + 1.0:
+		qa_note(tag, "título cortado: " + s.title)
+	var keep := s.sel
+	for i in s.items.size():
+		var it: Dictionary = s.items[i]
+		var t := str(it.get("t", ""))
+		s.sel = i
+		s._clamp_scroll()
+		s._refresh()
+		var row: int = i - s.scroll
+		if row >= 0 and row < s._rows.size():
+			var l: Label = s._rows[row]
+			var tw: float = font.get_string_size(l.text, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
+			if tw > l.size.x + 1.0:
+				qa_note(tag, "item cortado%s (%d > %d px): %s" % [" (toque)" if TouchControls.active else "", tw, l.size.x, t])
+		if _qa_raw_marker(t):
+			qa_note(tag, "marcador sem troca na lista: " + t, true)
+		if it.get("hdr", false):
+			continue
+		var info: String = s._info_text()
+		if info.strip_edges() == "" and not t in ["Voltar", "Fechar", "Sair"]:
+			qa_note(tag, "painel lateral vazio: " + t)
+		if _qa_raw_marker(info):
+			qa_note(tag, "marcador sem troca no painel: " + t, true)
+	s.sel = keep
+	s._clamp_scroll()
+	s._refresh()
+
+func qa_open(tag: String, opener: Callable) -> void:
+	await close_menus()
+	await frames(2)
+	opener.call()
+	await frames(3)
+	await qa_audit_menu(tag)
+
+func qa_setup() -> void:
+	SaveSys.delete_slot(6)
+	main.start_new_game(6)
+	await frames(10)
+	await advance_dialogs()
+	Game.hero["level"] = 22
+	Game.fragments = 2500
+	for it in Data.items:
+		Game.give_item(it, 2)
+	for sid in Data.species:
+		if Data.species[sid].get("status", "") == "jogavel":
+			Game.mark_seen(sid)
+	var lv := 6
+	for sid in ["brotisco", "faisquito", "umbrel", "ventisco", "cascalito", "lumipim", "galhardo", "ferragor", "goturim", "prismal"]:
+		if Data.species.has(sid):
+			var ind := r4_ind(sid, lv)
+			lv += 2
+			if Game.team.size() < 3:
+				Game.team.append(ind["uuid"])
+			else:
+				Game.sanctuary.append(ind["uuid"])
+	for e in ["raiz_viva", "ruptura_ignea", "olhar_velado", "passo_umbral"]:
+		Game.grant_eco(e)
+	Game.team_changed.emit(); Game.hero_changed.emit(); Game.inventory_changed.emit()
+	await frames(5)
+
+func qa_menus() -> void:
+	var ui = main.ui
+	await qa_open("pausa", func(): ui.open_pause())
+	await qa_open("equipe", func(): ui.open_pause(); ui.open_team())
+	var u: String = Game.team[0]
+	await qa_open("criatura", func(): ui.open_pause(); ui.open_team(); ui._creature_menu(u, ui._top()))
+	await qa_open("habilidades", func(): ui.open_habilidades(u))
+	await qa_open("acessorio", func(): ui._acc_menu(u, Callable()))
+	await qa_open("inventario", func(): ui.open_pause(); ui.open_inventory())
+	await qa_open("montar", func(): ui.open_craft())
+	await qa_open("desmontar", func(): ui.open_dismantle())
+	await qa_open("forja", func(): ui.open_forge())
+	await qa_open("bestiario", func(): ui.open_pause(); ui.open_bestiary())
+	for f in ["lenhador_morto", "cervo_morto", "vigia_morto", "ferreiro_morto"]:
+		Game.set_flag("mem_" + f)
+	await qa_open("diario", func(): ui.open_pause(); ui.open_diary())
+	await qa_open("mapa", func(): ui.open_pause(); ui.open_map())
+	await qa_open("jornada", func(): ui.open_pause(); ui.open_journey())
+	await qa_open("opcoes", func(): ui.open_pause(); ui.open_options())
+	await qa_open("salvar", func(): ui.open_pause(); ui.open_save_slots())
+	await qa_open("contratos", func(): ui.open_contracts())
+	await qa_open("santuario", func(): ui.open_shrine_menu())
+	await qa_open("armazem", func(): ui.open_storage())
+	for shop in Data.forge.get("lojas", {}):
+		await qa_open("loja_" + shop, func(): ui.open_shop(shop))
+	await close_menus()
+	P.set_busy(false)
+
+## Todos os textos dos dados: nenhum marcador {x} fica sem troca (teclado e toque).
+func qa_texts() -> void:
+	var srcs := {"dialogs": Data.dialogs, "items": Data.items, "skills": Data.skills, "story": Data.story, "species": Data.species, "quests": Data.quests}
+	for nm in srcs:
+		var stack: Array = [srcs[nm]]
+		while not stack.is_empty():
+			var v = stack.pop_back()
+			if v is Dictionary:
+				stack.append_array(v.values())
+			elif v is Array:
+				stack.append_array(v)
+			elif v is String:
+				for touch in [false, true]:
+					TouchControls.active = touch
+					if _qa_raw_marker(Game.k(v).replace("{nome}", "X")):
+						qa_note("texto " + nm, "marcador desconhecido%s: %s" % [" (toque)" if touch else "", v.left(70)], true)
+	TouchControls.active = false
+
+func qa_flags_all() -> void:
+	for mid in Data.maps:
+		var m: Dictionary = Data.maps[mid]
+		for e in m["entities"]:
+			if e.has("if_flag"):
+				Game.set_flag(str(e["if_flag"]))
+			for f in e.get("open_flags", []):
+				Game.set_flag(str(f))
+		for c in m.get("conditional", []):
+			if c.has("if"):
+				Game.set_flag(str(c["if"]))
+		for e in m["entities"]:
+			if str(e.get("type", "")) in ["tronco_oco"] and e.has("flag"):
+				Game.set_flag(str(e["flag"]))     # passagens abertas por observação
+
+func qa_reach(start: Vector2i) -> Dictionary:
+	var blocked := {}
+	var teles: Array = []      # fissuras (Passo Umbral) e pares de portais: atravessam paredes
+	var by_id := {}
+	for d in W.ent_defs:
+		if d.has("id"):
+			by_id[str(d["id"])] = d
+	for d in W.ent_defs:
+		if d["type"] == "fissura" and d.has("to"):
+			teles.append([Vector2i(int(d["x"]), int(d["y"])), Vector2i(int(d["to"][0]), int(d["to"][1]))])
+		elif d["type"] == "portal" and by_id.has(str(d.get("par", ""))):
+			var pd: Dictionary = by_id[str(d["par"])]
+			teles.append([Vector2i(int(d["x"]), int(d["y"])), Vector2i(int(pd["x"]), int(pd["y"]))])
+	for e in get_tree().get_nodes_in_group("ents"):
+		if e.solid and not (str(e.get("kind")) in ["crate", "cart", "pedra"]):
+			blocked[tile_of(e.global_position)] = true
+	var seen := {start: true}
+	var q := [start]
+	var used := {}
+	while true:
+		while not q.is_empty():
+			var c: Vector2i = q.pop_back()
+			for d in [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]:
+				var n: Vector2i = c + d
+				if n.x < 0 or n.y < 0 or n.x >= W.W or n.y >= W.H or seen.has(n):
+					continue
+				# plataformas de luz/sombra da Fortaleza alternam com o eclipse: contam como passáveis
+				if (W.is_solid_char(W.cur_tiles[n.y][n.x]) and not W.cur_tiles[n.y][n.x] in ["Δ", "Ψ"]) or blocked.has(n):
+					continue
+				seen[n] = true
+				q.append(n)
+		for i in teles.size():
+			if used.has(i) or not qa_near_reach(teles[i][0], seen, 1):
+				continue
+			used[i] = true
+			for d2 in [Vector2i.ZERO, Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]:
+				var n2: Vector2i = teles[i][1] + d2
+				if n2.x >= 0 and n2.y >= 0 and n2.x < W.W and n2.y < W.H and not seen.has(n2) and not W.is_solid_char(W.cur_tiles[n2.y][n2.x]):
+					seen[n2] = true
+					q.append(n2)
+		if q.is_empty():
+			break
+	return seen
+
+func qa_near_reach(t: Vector2i, reach: Dictionary, r := 1) -> bool:
+	for dy in range(-r, r + 1):
+		for dx in range(-r, r + 1):
+			if reach.has(t + Vector2i(dx, dy)):
+				return true
+	return false
+
+func qa_map(id: String, overview: bool) -> void:
+	var sp: Dictionary = Data.maps[id]["spawns"]
+	var first: String = "default" if sp.has("default") else str(sp.keys()[0])
+	W.load_map(id, first)
+	await frames(8)
+	await advance_dialogs()
+	for x in main.ui.hud.toasts:
+		x["node"].queue_free()
+	main.ui.hud.toasts.clear()
+	await frames(2)
+	var ss: Array = sp[first]
+	var reach := qa_reach(Vector2i(int(ss[0]), int(ss[1])))
+	for sn in sp:
+		var t := Vector2i(int(sp[sn][0]), int(sp[sn][1]))
+		if W.is_solid_char(W.cur_tiles[t.y][t.x]):
+			qa_note("mapa " + id, "spawn '%s' em tile sólido '%s' %s" % [sn, W.cur_tiles[t.y][t.x], str(t)], true)
+		elif not reach.has(t):
+			qa_note("mapa " + id, "spawn '%s' %s não liga ao spawn '%s' (tudo aberto)" % [sn, str(t), first])
+		for d in W.ent_defs:
+			if d["type"] == "exit" and Rect2i(int(d["x"]), int(d["y"]), int(d["w"]), int(d["h"])).has_point(t):
+				qa_note("mapa " + id, "spawn '%s' dentro da saída para %s" % [sn, d["to"]], true)
+	for d in W.ent_defs:
+		if d["type"] != "exit" or not W._def_visible(d):
+			continue
+		var ok := false
+		for j in int(d["h"]):
+			for i in int(d["w"]):
+				if qa_near_reach(Vector2i(int(d["x"]) + i, int(d["y"]) + j), reach, 1):
+					ok = true
+		if not ok:
+			qa_note("mapa " + id, "saída para %s (%d,%d) inalcançável a partir do spawn '%s' (tudo aberto)" % [d["to"], d["x"], d["y"], first])
+		if not Data.maps.has(str(d["to"])) or not Data.maps[str(d["to"])]["spawns"].has(str(d.get("spawn", "default"))):
+			qa_note("mapa " + id, "saída para %s:%s sem mapa/spawn de destino" % [d["to"], d.get("spawn", "default")], true)
+	for e in get_tree().get_nodes_in_group("ents"):
+		var t2 := tile_of(e.global_position)
+		var ch: String = W.cur_tiles[t2.y][t2.x] if (t2.y >= 0 and t2.y < W.H and t2.x >= 0 and t2.x < W.W) else "?"
+		var kd: String = str(e.get("kind"))
+		if kd in ["prop", "exit"]:
+			continue
+		if not qa_near_reach(t2, reach, 1):
+			qa_note("mapa " + id, "%s '%s' inalcançável %s (tile '%s')" % [kd, str(e.get("id")), str(t2), ch])
+	for e in get_tree().get_nodes_in_group("enemies"):
+		var t3 := tile_of(e.global_position)
+		if t3.x >= 0 and t3.y >= 0 and t3.x < W.W and t3.y < W.H and W.is_solid_char(W.cur_tiles[t3.y][t3.x]):
+			qa_note("mapa " + id, "inimigo %s em tile sólido '%s' %s" % [str(e.get("kind")), W.cur_tiles[t3.y][t3.x], str(t3)])
+	await shot("qa_map_" + id)
+	if overview and DisplayServer.get_name() != "headless":
+		main.ui.hud.hud_hidden = true
+		W.darkness.visible = false
+		var z: float = min(480.0 / (W.W * 16.0), 270.0 / (W.H * 16.0))
+		W.camera.top_level = true
+		W.camera.limit_right = 100000; W.camera.limit_bottom = 100000; W.camera.limit_left = -100000; W.camera.limit_top = -100000
+		W.camera.zoom = Vector2(z, z)
+		W.camera.global_position = Vector2(W.W * 8.0, W.H * 8.0)
+		await frames(3)
+		await shot("qa_ov_" + id)
+		W.camera.top_level = false
+		W.camera.zoom = Vector2.ONE
+		W.camera.position = Vector2.ZERO
+		main.ui.hud.hud_hidden = false
+
+## Estados presos: fechar a fala com a mesma tecla de interagir não reabre a conversa; tocar num objeto e
+## ser interrompido por uma fala não deixa o herói andando sozinho depois.
+func qa_states() -> void:
+	SaveSys.delete_slot(6)
+	main.start_new_game(6)
+	await frames(10)
+	await advance_dialogs()
+	var maru := ent_by_id("anciao")
+	await goto(maru.global_position + Vector2(0, 16), 6.0)
+	await face(Vector2.UP)
+	await frames(3)
+	await ui_press("interact")
+	await frames(3)
+	var opened: bool = main.ui.hud.dlg_active
+	var n := 0
+	while main.ui.hud.dlg_active and n < 40:
+		await frames(70)
+		await ui_press("interact")
+		n += 1
+	await frames(6)
+	check("QA: fechar a fala com {interagir} não reabre a conversa", opened and not main.ui.hud.dlg_active and P.state == Player.S.FREE, "aberta=%s dlg=%s estado=%d" % [opened, main.ui.hud.dlg_active, P.state])
+	# toque num objeto distante + fala no caminho: depois da fala o herói fica parado
+	var placa := ent_by_id("placa_vila")
+	if placa == null:
+		for e in get_tree().get_nodes_in_group("ents"):
+			if e.kind == "sign":
+				placa = e
+				break
+	P.go_interact(placa)
+	await frames(4)
+	main.ui.dialog(["Teste: fala que interrompe a caminhada."], func(): pass)
+	await frames(3)
+	await advance_dialogs()
+	var p0: Vector2 = P.global_position
+	await frames(30)
+	check("QA: fala no meio da caminhada por toque cancela a caminhada", P.auto_ent == null and P.global_position.distance_to(p0) < 2.0, "%s -> %s" % [p0, P.global_position])
+
+func run_qa() -> void:
+	Game.god_mode = true
+	await qa_states()
+	await qa_setup()
+	if not "--so-mapas" in args:
+		for touch in [false, true]:
+			TouchControls.active = touch
+			await qa_menus()
+		TouchControls.active = false
+		qa_texts()
+	if not "--so-menus" in args:
+		qa_flags_all()
+		var ids: Array = Data.maps.keys()
+		ids.sort()
+		for id in ids:
+			await qa_map(id, true)
+	print("QA: total de achados = %d (objetivos: %d)" % [qa_n, qa_hard])
+	check("QA: sem achados objetivos (marcadores, spawns, saídas)", qa_hard == 0, str(qa_hard))
